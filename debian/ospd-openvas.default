@@ -1,0 +1,8 @@
+# Defaults for OpenVAS Scanner OSP server initscript
+# sourced by /etc/init.d/ospd-openvas
+# installed at /etc/default/ospd-openvas by the maintainer scripts
+
+# For more information see `man ospd-openvas`
+
+# pass arbitrary arguments to ospd-openvas daemon
+DAEMON_ARGS=""

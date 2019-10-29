@@ -1,0 +1,24 @@
+Source: ospd-openvas
+Section: net
+Priority: optional
+Maintainer: Mohammad Razavi <mrazavi64@gmail.com>
+Build-Depends: debhelper (>= 10), dh-python, python3-all, python3-setuptools, python3-ospd (>= 2.0.0), python3-psutil
+Standards-Version: 4.1.2
+Homepage: https://community.greenbone.net/
+X-Python3-Version: >= 3.2
+Vcs-Git: https://github.com/admirito/ospd-openvas.git
+Vcs-Browser: https://github.com/admirito/ospd
+Testsuite: autopkgtest-pkg-python
+
+Package: ospd-openvas
+Architecture: all
+Depends: lsb-base, ${python3:Depends}, ${misc:Depends}
+Recommends: openvas (>= 1:7.0.0), redis-server, rsyslog
+Description: OSP server to allow GVM to remotely control an OpenVAS Scanner
+ This is an OSP server implementation to allow GVM to remotely control
+ an OpenVAS Scanner, see https://github.com/greenbone/openvas-scanner.
+ .
+ Once running, you need to configure the Scanner for the Greenbone
+ Vulnerability Manager, for example via the web interface Greenbone
+ Security Assistant. Then you can create scan tasks to use this
+ scanner.

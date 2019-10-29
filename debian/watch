@@ -1,0 +1,9 @@
+# You can run the "uscan" command to check for upstream updates and
+# more.  See uscan(1) for format
+
+# Compulsory line, this is a version 4 file
+version=4
+
+opts=uversionmangle=s/\.beta/~beta/ \
+https://github.com/greenbone/ospd-openvas/releases  \
+        /greenbone/ospd-openvas/archive/v(.*)\.tar\.gz

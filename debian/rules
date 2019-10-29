@@ -1,0 +1,17 @@
+#!/usr/bin/make -f
+# See debhelper(7) (uncomment to enable)
+# output every command that modifies files on the build system.
+#export DH_VERBOSE = 1
+
+export PYBUILD_NAME=ospd-openvas
+
+override_dh_auto_clean:
+	find -name '*.pyc' -delete
+	find -name __pycache__ -type d -delete
+	rm -rf .eggs ospd_openvas.egg-info
+
+override_dh_auto_test:
+	true
+
+%:
+	dh $@ --with python3 --buildsystem=pybuild
