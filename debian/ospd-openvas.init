@@ -22,13 +22,14 @@ NAME=ospd-openvas
 DAEMON=/usr/bin/ospd-openvas
 PIDFILE=/var/run/$NAME.pid
 SCRIPTNAME=/etc/init.d/$NAME
-DAEMON_ARGS="$DAEMON_ARGS --pid-file=$PIDFILE"
 
 # Exit if the package is not installed
 [ -x "$DAEMON" ] || exit 0
 
 # Read configuration variable file if it is present
 [ -r /etc/default/$DESC ] && . /etc/default/$DESC
+
+DAEMON_ARGS="$DAEMON_ARGS --pid-file=$PIDFILE"
 
 # Load the VERBOSE setting and other rcS variables
 . /lib/init/vars.sh
