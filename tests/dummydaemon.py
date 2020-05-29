@@ -20,6 +20,7 @@
 from unittest.mock import patch
 
 from ospd_openvas.daemon import OSPDopenvas
+from defusedxml import ElementTree as secET
 
 
 class DummyDaemon(OSPDopenvas):
@@ -27,31 +28,14 @@ class DummyDaemon(OSPDopenvas):
 
         self.VT = {
             '1.3.6.1.4.1.25623.1.0.100061': {
-                'creation_time': '1237458156',
-                'custom': {
-                    'category': '3',
-                    'excluded_keys': 'Settings/disable_cgi_scanning',
-                    'family': 'Product detection',
-                    'filename': 'mantis_detect.nasl',
-                    'required_ports': 'Services/www, 80',
-                    'timeout': '0',
-                },
-                'modification_time': (
-                    '1533906565'
-                ),
+                'custom': {'family': 'Product detection',},
+                'modification_time': ('1533906565'),
                 'name': 'Mantis Detection',
                 'qod_type': 'remote_banner',
-                'insight': 'some insight',
                 'severities': {
                     'severity_base_vector': 'AV:N/AC:L/Au:N/C:N/I:N/A:N',
                     'severity_type': 'cvss_base_v2',
                 },
-                'solution': 'some solution',
-                'solution_type': 'WillNotFix',
-                'impact': 'some impact',
-                'summary': 'some summary',
-                'affected': 'some affection',
-                'vt_dependencies': [],
                 'vt_params': {
                     '1': {
                         'id': '1',
@@ -67,11 +51,6 @@ class DummyDaemon(OSPDopenvas):
                         'name': 'Do not randomize the  order  in  which ports are scanned',
                         'type': 'checkbox',
                     },
-                },
-                'vt_refs': {
-                    'bid': [''],
-                    'cve': [''],
-                    'xref': ['URL:http://www.mantisbt.org/'],
                 },
             }
         }
@@ -106,9 +85,7 @@ class DummyDaemon(OSPDopenvas):
             'excluded_keys': 'Settings/disable_cgi_scanning',
             'family': 'Product detection',
             'filename': 'mantis_detect.nasl',
-            'last_modification': (
-                '1533906565'
-            ),
+            'last_modification': ('1533906565'),
             'name': 'Mantis Detection',
             'qod_type': 'remote_banner',
             'required_ports': 'Services/www, 80',
@@ -123,7 +100,19 @@ class DummyDaemon(OSPDopenvas):
 
         self.openvas_db = redis
         self.nvti = nvti
+        kwargs = {'lock_file_dir': '/tmp'}
         with patch('ospd_openvas.daemon.OpenvasDB', return_value=redis):
             with patch('ospd_openvas.daemon.NVTICache', return_value=nvti):
                 with patch.object(OSPDopenvas, 'load_vts', return_value=None):
-                    super().__init__(niceness=10)
+                    super().__init__(niceness=10, **kwargs)
+
+    def create_xml_target(self):
+        target = secET.fromstring(
+            "<targets>"
+            "<target>"
+            "<hosts>192.168.0.1</hosts>"
+            "<ports>80,443</ports>"
+            "</target>"
+            "</targets>"
+        )
+        return target

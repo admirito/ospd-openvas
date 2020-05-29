@@ -20,13 +20,25 @@
 """ Provide functions to handle NVT Info Cache. """
 
 import logging
+import subprocess
+
+from subprocess import CalledProcessError
+
+from packaging.specifiers import SpecifierSet
+from packaging.version import parse as parse_version
 
 from ospd_openvas.db import NVT_META_FIELDS
+from ospd_openvas.errors import OspdOpenvasError
+
 
 logger = logging.getLogger(__name__)
 
 LIST_FIRST_POS = 0
 LIST_LAST_POS = -1
+
+# actually the nvti cache with gvm-libs 10 should fit too but openvas was only
+# introduced with GVM 11 and gvm-libs 11
+SUPPORTED_NVTICACHE_VERSIONS_SPECIFIER = SpecifierSet('>=11.0')
 
 
 class NVTICache(object):
@@ -48,16 +60,75 @@ class NVTICache(object):
         'default': '70',
     }
 
-    NVTICACHE_STR = 'nvticache11.0.0'
-
     def __init__(self, openvas_db):
         self._openvas_db = openvas_db
+        self._nvti_cache_name = None
+
+    def _get_nvti_cache_name(self) -> str:
+        if not self._nvti_cache_name:
+            self._set_nvti_cache_name()
+
+        return self._nvti_cache_name
+
+    def _get_gvm_libs_version_string(self) -> str:
+        """ Parse version of gvm-libs
+        """
+        try:
+            result = subprocess.check_output(['openvas', '--version'],)
+        except (CalledProcessError, PermissionError) as e:
+            raise OspdOpenvasError(
+                "Not possible to get the installed gvm-libs version. %s" % e
+            )
+
+        output = result.decode('utf-8').rstrip()
+
+        if 'gvm-libs' not in output:
+            raise OspdOpenvasError(
+                "Not possible to get the installed gvm-libs version. "
+                "Outdated openvas version. openvas version needs to be at "
+                "least 7.0.1."
+            )
+
+        lines = output.splitlines()
+        _, version_string = lines[1].split(' ', 1)
+        return version_string
+
+    def _is_compatible_version(self, version: str) -> bool:
+        installed_version = parse_version(version)
+        return installed_version in SUPPORTED_NVTICACHE_VERSIONS_SPECIFIER
+
+    def _set_nvti_cache_name(self):
+        """Set nvticache name"""
+        version_string = self._get_gvm_libs_version_string()
+
+        if self._is_compatible_version(version_string):
+            self._nvti_cache_name = "nvticache{}".format(version_string)
+        else:
+            raise OspdOpenvasError(
+                "Error setting nvticache. Incompatible nvticache "
+                "version {}. Supported versions are {}.".format(
+                    version_string,
+                    ", ".join(
+                        [
+                            str(spec)
+                            for spec in SUPPORTED_NVTICACHE_VERSIONS_SPECIFIER
+                        ]
+                    ),
+                )
+            )
+
+    def get_redis_context(self):
+        """ Return the redix context for this nvti cache
+        """
+        return self._openvas_db.db_find(self._get_nvti_cache_name())
 
     def get_feed_version(self):
         """ Get feed version.
         """
-        ctx = self._openvas_db.db_find(self.NVTICACHE_STR)
-        return self._openvas_db.get_single_item(self.NVTICACHE_STR, ctx=ctx)
+        ctx = self.get_redis_context()
+        return self._openvas_db.get_single_item(
+            self._get_nvti_cache_name(), ctx=ctx
+        )
 
     def get_oids(self):
         """ Get the list of NVT OIDs.
@@ -77,6 +148,9 @@ class NVTICache(object):
         ctx = self._openvas_db.get_kb_context()
         prefs = self.get_nvt_prefs(ctx, oid)
         timeout = self.get_nvt_timeout(ctx, oid)
+
+        if timeout is None:
+            return None
 
         vt_params = {}
         if int(timeout) > 0:

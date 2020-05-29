@@ -41,7 +41,7 @@ Show a summary of the commands
 
 .TP
 .BI "-p " PORT ", --port "PORT
-TCP Port to listen on. Default: 1234
+TCP Port to listen on. Default: 0
 
 .TP
 .BI "-b " ADDRESS ", --bind-address "ADDRESS
@@ -49,11 +49,19 @@ Address to listen on. Default: 0.0.0.0
 
 .TP
 .BI "-u " UNIX_SOCKET ", --unix-socket "UNIX_SOCKET
-Unix file socket to listen on. Default: /tmp/ospd.sock
+Unix file socket to listen on. Default: /var/run/ospd/ospd.sock
 
 .TP
 .BI "-m " SOCKET_MODE ", --socket-mode "SOCKET_MODE
 Unix file socket mode. Default: 0o700
+
+.TP
+.BI "--pid-file "PID_FILE
+Location of the file for the process ID. Default: /var/run/ospd.pid
+
+.TP
+.BI "--lock-file-dir "LOCK_FILE_DIR
+Directory where the feed lock file is placed. Default: /var/run/ospd
 
 .TP
 .BI "-k " KEY_FILE ", --key-file "KEY_FILE
@@ -89,6 +97,11 @@ Set a timeout on socket operations. Default 10 seconds
 .BI "--niceness "NICENESS
 Start the scan with the given niceness. Default 10
 
+.TP
+.BI "--scaninfo-store-time "TIME
+Time in hours a scan is stored before being considered forgotten and being delete from
+the scan table. Default 0, disabled.
+
 .SH THE CONFIGURATION FILE
 
 The default
@@ -107,6 +120,9 @@ It must be set in octal format. E.g. socket_mode = 0o770
 .IP unix_socket
 This option specifies the socket path.
 
+.IP pid_file
+Location of the file for the process ID.
+
 .IP log_file
 Path to the log file. If no log file is given, the system log
 facility is used by default.
@@ -120,6 +136,10 @@ Start the scan with the given niceness. Default 10
 
 .IP stream_timeout
 Set a timeout on socket operations. Default 10 seconds
+
+.IP scaninfo_store_time
+Time in hours a scan is stored before being considered forgotten and being delete from
+the scan table. Default 0, disabled.
 
 .SH MORE INFORMATION ABOUT Greenbone Vulnerability Management
 

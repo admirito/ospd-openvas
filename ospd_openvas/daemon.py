@@ -25,8 +25,10 @@ import logging
 import subprocess
 import time
 import uuid
+import binascii
 
 from datetime import datetime
+from base64 import b64decode
 
 from pathlib import Path
 from os import geteuid
@@ -196,27 +198,24 @@ OSPD_PARAMS = {
         'mandatory': 1,
         'description': '',
     },
-    'use_mac_addr': {
+    'expand_vhosts': {
         'type': 'boolean',
-        'name': 'use_mac_addr',
+        'name': 'expand_vhosts',
+        'default': 1,
+        'mandatory': 0,
+        'description': 'Whether to expand the target hosts '
+        + 'list of vhosts with values gathered from sources '
+        + 'such as reverse-lookup queries and VT checks '
+        + 'for SSL/TLS certificates.',
+    },
+    'test_empty_vhost': {
+        'type': 'boolean',
+        'name': 'test_empty_vhost',
         'default': 0,
         'mandatory': 0,
-        'description': 'To test the local network. '
-        + 'Hosts will be referred to by their MAC address.',
-    },
-    'vhosts': {
-        'type': 'string',
-        'name': 'vhosts',
-        'default': '',
-        'mandatory': 0,
-        'description': '',
-    },
-    'vhosts_ip': {
-        'type': 'string',
-        'name': 'vhosts_ip',
-        'default': '',
-        'mandatory': 0,
-        'description': '',
+        'description': 'If  set  to  yes, the scanner will '
+        + 'also test the target by using empty vhost value '
+        + 'in addition to the targets associated vhost values.',
     },
 }
 
@@ -250,15 +249,18 @@ class OSPDopenvas(OSPDaemon):
 
     """ Class for ospd-openvas daemon. """
 
-    def __init__(self, *, niceness=None, **kwargs):
+    def __init__(
+        self, *, niceness=None, lock_file_dir='/var/run/ospd', **kwargs
+    ):
         """ Initializes the ospd-openvas daemon's internal data. """
 
-        super().__init__(customvtfilter=OpenVasVtsFilter())
+        super().__init__(customvtfilter=OpenVasVtsFilter(), **kwargs)
 
         self.server_version = __version__
 
         self._niceness = str(niceness)
 
+        self.feed_lock_file = Path(lock_file_dir) / 'feed-update.lock'
         self.scanner_info['name'] = 'openvas'
         self.scanner_info['version'] = ''  # achieved during self.check()
         self.scanner_info['description'] = OSPD_DESC
@@ -282,11 +284,14 @@ class OSPDopenvas(OSPDaemon):
     def init(self):
         self.openvas_db.db_init()
 
-        ctx = self.openvas_db.db_find(self.nvti.NVTICACHE_STR)
+        ctx = self.nvti.get_redis_context()
 
         if not ctx:
+            while not self.create_feed_lock_file():
+                time.sleep(10)
             self.redis_nvticache_init()
-            ctx = self.openvas_db.db_find(self.nvti.NVTICACHE_STR)
+            self.delete_feed_lock_file()
+            ctx = self.nvti.get_redis_context()
 
         self.openvas_db.set_redisctx(ctx)
 
@@ -355,11 +360,51 @@ class OSPDopenvas(OSPDaemon):
             return True
         return False
 
+    def feed_locked(self):
+        """ Check if there is an already lock file set for the feed. """
+        if self.feed_lock_file.is_file():
+            logger.info(
+                "A feed update process is running. Trying again later..."
+            )
+            return True
+
+        return False
+
+    def create_feed_lock_file(self):
+        """ Create a lock file.
+            Return: True in success, False otherwise.
+        """
+        if self.feed_locked():
+            return False
+        else:
+            try:
+                with self.feed_lock_file.open('w') as f:
+                    f.write("locked")
+            except (FileNotFoundError, PermissionError) as e:
+                logger.error(
+                    "Failed to create feed lock file %s. %s",
+                    self.feed_lock_file,
+                    e,
+                )
+                return False
+
+        return True
+
+    def delete_feed_lock_file(self):
+        """ Delete the feed lock file.
+        """
+        if self.feed_lock_file.is_file():
+            self.feed_lock_file.unlink()
+            logger.debug("Feed lock file removed.")
+
     def check_feed(self):
         """ Check if there is a feed update. Wait until all the running
         scans finished. Set a flag to anounce there is a pending feed update,
         which avoid to start a new scan.
         """
+        if not self.is_cache_available:
+            return
+
         current_feed = self.nvti.get_feed_version()
         # Check if the feed is already accessible in the disk.
         if current_feed and self.feed_is_outdated(current_feed) is None:
@@ -368,10 +413,21 @@ class OSPDopenvas(OSPDaemon):
 
         # Check if the nvticache in redis is outdated
         if not current_feed or self.feed_is_outdated(current_feed):
-            self.redis_nvticache_init()
-            ctx = self.openvas_db.db_find(self.nvti.NVTICACHE_STR)
-            self.openvas_db.set_redisctx(ctx)
             self.pending_feed = True
+            if self.create_feed_lock_file():
+                self.is_cache_available = False
+                self.redis_nvticache_init()
+                ctx = self.nvti.get_redis_context()
+                self.openvas_db.set_redisctx(ctx)
+                self.delete_feed_lock_file()
+                self.is_cache_available = True
+            else:
+                logger.debug(
+                    "The feed was not upload or it is outdated, "
+                    "but other process is locking the update. "
+                    "Trying again later..."
+                )
+                return
 
         _running_scan = False
         for scan_id in self.scan_processes:
@@ -386,14 +442,14 @@ class OSPDopenvas(OSPDaemon):
                 self.get_vts_version() != self.nvti.get_feed_version()
             )
 
-        if _running_scan and _pending_feed:
+        if _pending_feed and (_running_scan or self.feed_locked()):
             if not self.pending_feed:
                 self.pending_feed = True
-                logger.debug(
-                    'There is a running scan. Therefore the feed '
-                    'update will be performed later.'
+                logger.info(
+                    'There is a running process blocking the feed update. '
+                    'Therefore the feed update will be performed later.'
                 )
-        elif not _running_scan and _pending_feed:
+        elif _pending_feed and not _running_scan and not self.feed_locked():
             self.vts = dict()
             self.load_vts()
 
@@ -401,98 +457,164 @@ class OSPDopenvas(OSPDaemon):
         """This method is called periodically to run tasks."""
         self.check_feed()
 
+    def get_single_vt(self, vt_id, oids):
+        _vt_params = self.nvti.get_nvt_params(vt_id)
+        _vt_refs = self.nvti.get_nvt_refs(vt_id)
+        _custom = self.nvti.get_nvt_metadata(vt_id)
+
+        _name = _custom.pop('name')
+        _vt_creation_time = _custom.pop('creation_date')
+        _vt_modification_time = _custom.pop('last_modification')
+
+        _vt_dependencies = list()
+        if 'dependencies' in _custom:
+            _deps = _custom.pop('dependencies')
+            _deps_list = _deps.split(', ')
+            for dep in _deps_list:
+                _vt_dependencies.append(oids.get('filename:' + dep))
+
+        _summary = None
+        _impact = None
+        _affected = None
+        _insight = None
+        _solution = None
+        _solution_t = None
+        _vuldetect = None
+        _qod_t = None
+        _qod_v = None
+
+        if 'summary' in _custom:
+            _summary = _custom.pop('summary')
+        if 'impact' in _custom:
+            _impact = _custom.pop('impact')
+        if 'affected' in _custom:
+            _affected = _custom.pop('affected')
+        if 'insight' in _custom:
+            _insight = _custom.pop('insight')
+        if 'solution' in _custom:
+            _solution = _custom.pop('solution')
+            if 'solution_type' in _custom:
+                _solution_t = _custom.pop('solution_type')
+
+        if 'vuldetect' in _custom:
+            _vuldetect = _custom.pop('vuldetect')
+        if 'qod_type' in _custom:
+            _qod_t = _custom.pop('qod_type')
+        elif 'qod' in _custom:
+            _qod_v = _custom.pop('qod')
+
+        _severity = dict()
+        if 'severity_base_vector' in _custom:
+            _severity_vector = _custom.pop('severity_base_vector')
+        else:
+            _severity_vector = _custom.pop('cvss_base_vector')
+        _severity['severity_base_vector'] = _severity_vector
+        if 'severity_type' in _custom:
+            _severity_type = _custom.pop('severity_type')
+        else:
+            _severity_type = 'cvss_base_v2'
+        _severity['severity_type'] = _severity_type
+        if 'severity_origin' in _custom:
+            _severity['severity_origin'] = _custom.pop('severity_origin')
+
+        if _name is None:
+            _name = ''
+
+        vt = {'name': _name}
+        if _custom is not None:
+            vt["custom"] = _custom
+        if _vt_params is not None:
+            vt["vt_params"] = _vt_params
+        if _vt_refs is not None:
+            vt["vt_refs"] = _vt_refs
+        if _vt_dependencies is not None:
+            vt["vt_dependencies"] = _vt_dependencies
+        if _vt_creation_time is not None:
+            vt["creation_time"] = _vt_creation_time
+        if _vt_modification_time is not None:
+            vt["modification_time"] = _vt_modification_time
+        if _summary is not None:
+            vt["summary"] = _summary
+        if _impact is not None:
+            vt["impact"] = _impact
+        if _affected is not None:
+            vt["affected"] = _affected
+        if _insight is not None:
+            vt["insight"] = _insight
+
+        if _solution is not None:
+            vt["solution"] = _solution
+            if _solution_t is not None:
+                vt["solution_type"] = _solution_t
+
+        if _vuldetect is not None:
+            vt["detection"] = _vuldetect
+
+        if _qod_t is not None:
+            vt["qod_type"] = _qod_t
+        elif _qod_v is not None:
+            vt["qod"] = _qod_v
+
+        if _severity is not None:
+            vt["severities"] = _severity
+
+        return vt
+
+    def get_vt_iterator(self):
+        """ Yield the vts from the Redis NVTicache. """
+        oids = dict(self.nvti.get_oids())
+        for _, vt_id in oids.items():
+            vt = self.get_single_vt(vt_id, oids)
+            yield (vt_id, vt)
+
     def load_vts(self):
         """ Load the NVT's metadata into the vts
         global  dictionary. """
-        logger.debug('Loading vts in memory.')
+        self.is_cache_available = False
+
+        if not self.create_feed_lock_file():
+            logger.warning(
+                'Error creating feed lock file. Trying again later...'
+            )
+            return
+
+        logger.info('Loading vts in memory.')
         oids = dict(self.nvti.get_oids())
-        for _filename, vt_id in oids.items():
-            _vt_params = self.nvti.get_nvt_params(vt_id)
-            _vt_refs = self.nvti.get_nvt_refs(vt_id)
-            _custom = self.nvti.get_nvt_metadata(vt_id)
-            _name = _custom.pop('name')
-            _vt_creation_time = _custom.pop('creation_date')
-            _vt_modification_time = _custom.pop('last_modification')
+        for _, vt_id in oids.items():
+            vt = self.get_single_vt(vt_id, oids)
 
-            _summary = None
-            _impact = None
-            _affected = None
-            _insight = None
-            _solution = None
-            _solution_t = None
-            _vuldetect = None
-            _qod_t = None
-            _qod_v = None
+            if (
+                not vt
+                or vt.get('vt_params') is None
+                or vt.get('custom') is None
+            ):
+                logger.warning(
+                    'Error loading VTs in memory. Trying again later...'
+                )
+                return
 
-            if 'summary' in _custom:
-                _summary = _custom.pop('summary')
-            if 'impact' in _custom:
-                _impact = _custom.pop('impact')
-            if 'affected' in _custom:
-                _affected = _custom.pop('affected')
-            if 'insight' in _custom:
-                _insight = _custom.pop('insight')
-            if 'solution' in _custom:
-                _solution = _custom.pop('solution')
-                if 'solution_type' in _custom:
-                    _solution_t = _custom.pop('solution_type')
-
-            if 'vuldetect' in _custom:
-                _vuldetect = _custom.pop('vuldetect')
-            if 'qod_type' in _custom:
-                _qod_t = _custom.pop('qod_type')
-            elif 'qod' in _custom:
-                _qod_v = _custom.pop('qod')
-
-            _severity = dict()
-            if 'severity_base_vector' in _custom:
-                _severity_vector = _custom.pop('severity_base_vector')
-            else:
-                _severity_vector = _custom.pop('cvss_base_vector')
-            _severity['severity_base_vector'] = _severity_vector
-            if 'severity_type' in _custom:
-                _severity_type = _custom.pop('severity_type')
-            else:
-                _severity_type = 'cvss_base_v2'
-            _severity['severity_type'] = _severity_type
-            if 'severity_origin' in _custom:
-                _severity['severity_origin'] = _custom.pop('severity_origin')
-
-            _vt_dependencies = list()
-            if 'dependencies' in _custom:
-                _deps = _custom.pop('dependencies')
-                _deps_list = _deps.split(', ')
-                for dep in _deps_list:
-                    _vt_dependencies.append(oids.get('filename:' + dep))
-
+            custom = {'family': vt['custom'].get('family')}
             try:
                 self.add_vt(
                     vt_id,
-                    name=_name,
-                    vt_params=_vt_params,
-                    vt_refs=_vt_refs,
-                    custom=_custom,
-                    vt_creation_time=_vt_creation_time,
-                    vt_modification_time=_vt_modification_time,
-                    vt_dependencies=_vt_dependencies,
-                    summary=_summary,
-                    impact=_impact,
-                    affected=_affected,
-                    insight=_insight,
-                    solution=_solution,
-                    solution_t=_solution_t,
-                    detection=_vuldetect,
-                    qod_t=_qod_t,
-                    qod_v=_qod_v,
-                    severities=_severity,
+                    name=vt.get('name'),
+                    qod_t=vt.get('qod_type'),
+                    qod_v=vt.get('qod'),
+                    severities=vt.get('severities'),
+                    vt_modification_time=vt.get('modification_time'),
+                    vt_params=vt.get('vt_params'),
+                    custom=custom,
                 )
             except OspdError as e:
                 logger.info("Error while adding vt. %s", e)
 
         _feed_version = self.nvti.get_feed_version()
         self.set_vts_version(vts_version=_feed_version)
+        self.delete_feed_lock_file()
+        self.is_cache_available = True
         self.pending_feed = False
-        logger.debug('Finish loading up vts.')
+
+        logger.info('Finish loading up vts.')
 
     @staticmethod
     def get_custom_vt_as_xml_str(vt_id, custom):
@@ -507,8 +629,12 @@ class OSPDopenvas(OSPDaemon):
         _custom = Element('custom')
         for key, val in custom.items():
             xml_key = SubElement(_custom, key)
-            xml_key.text = val
-
+            try:
+                xml_key.text = val
+            except ValueError as e:
+                logger.warning(
+                    "Not possible to parse custom tag for vt %s: %s", vt_id, e
+                )
         return tostring(_custom).decode('utf-8')
 
     @staticmethod
@@ -523,7 +649,12 @@ class OSPDopenvas(OSPDaemon):
         _severities = Element('severities')
         _severity = SubElement(_severities, 'severity')
         if 'severity_base_vector' in severities:
-            _severity.text = severities.get('severity_base_vector')
+            try:
+                _severity.text = severities.get('severity_base_vector')
+            except ValueError as e:
+                logger.warning(
+                    "Not possible to parse severity tag for vt %s: %s", vt_id, e
+                )
         if 'severity_origin' in severities:
             _severity.set('origin', severities.get('severity_origin'))
         if 'severity_type' in severities:
@@ -546,10 +677,22 @@ class OSPDopenvas(OSPDaemon):
             vt_param.set('type', prefs['type'])
             vt_param.set('id', _pref_id)
             xml_name = SubElement(vt_param, 'name')
-            xml_name.text = prefs['name']
+            try:
+                xml_name.text = prefs['name']
+            except ValueError as e:
+                logger.warning(
+                    "Not possible to parse parameter for vt %s: %s", vt_id, e
+                )
             if prefs['default']:
                 xml_def = SubElement(vt_param, 'default')
-                xml_def.text = prefs['default']
+                try:
+                    xml_def.text = prefs['default']
+                except ValueError as e:
+                    logger.warning(
+                        "Not possible to parse default parameter for vt %s: %s",
+                        vt_id,
+                        e,
+                    )
             vt_params_xml.append(vt_param)
 
         return tostring(vt_params_xml).decode('utf-8')
@@ -605,7 +748,7 @@ class OSPDopenvas(OSPDaemon):
             _vt_dep = Element('dependency')
             try:
                 _vt_dep.set('vt_id', dep)
-            except TypeError:
+            except (ValueError, TypeError):
                 logger.error(
                     'Not possible to add dependency %s for vt %s', dep, vt_id
                 )
@@ -626,7 +769,12 @@ class OSPDopenvas(OSPDaemon):
             string: xml element as string.
         """
         _time = Element('creation_time')
-        _time.text = creation_time
+        try:
+            _time.text = creation_time
+        except ValueError as e:
+            logger.warning(
+                "Not possible to parse creation time for vt %s: %s", vt_id, e
+            )
         return tostring(_time).decode('utf-8')
 
     @staticmethod
@@ -641,7 +789,14 @@ class OSPDopenvas(OSPDaemon):
             string: xml element as string.
         """
         _time = Element('modification_time')
-        _time.text = modification_time
+        try:
+            _time.text = modification_time
+        except ValueError as e:
+            logger.warning(
+                "Not possible to parse modification time for vt %s: %s",
+                vt_id,
+                e,
+            )
         return tostring(_time).decode('utf-8')
 
     @staticmethod
@@ -654,7 +809,12 @@ class OSPDopenvas(OSPDaemon):
             string: xml element as string.
         """
         _summary = Element('summary')
-        _summary.text = summary
+        try:
+            _summary.text = summary
+        except ValueError as e:
+            logger.warning(
+                "Not possible to parse summary tag for vt %s: %s", vt_id, e
+            )
         return tostring(_summary).decode('utf-8')
 
     @staticmethod
@@ -668,7 +828,12 @@ class OSPDopenvas(OSPDaemon):
             string: xml element as string.
         """
         _impact = Element('impact')
-        _impact.text = impact
+        try:
+            _impact.text = impact
+        except ValueError as e:
+            logger.warning(
+                "Not possible to parse impact tag for vt %s: %s", vt_id, e
+            )
         return tostring(_impact).decode('utf-8')
 
     @staticmethod
@@ -681,7 +846,12 @@ class OSPDopenvas(OSPDaemon):
             string: xml element as string.
         """
         _affected = Element('affected')
-        _affected.text = affected
+        try:
+            _affected.text = affected
+        except ValueError as e:
+            logger.warning(
+                "Not possible to parse affected tag for vt %s: %s", vt_id, e
+            )
         return tostring(_affected).decode('utf-8')
 
     @staticmethod
@@ -694,7 +864,12 @@ class OSPDopenvas(OSPDaemon):
             string: xml element as string.
         """
         _insight = Element('insight')
-        _insight.text = insight
+        try:
+            _insight.text = insight
+        except ValueError as e:
+            logger.warning(
+                "Not possible to parse insight tag for vt %s: %s", vt_id, e
+            )
         return tostring(_insight).decode('utf-8')
 
     @staticmethod
@@ -708,7 +883,12 @@ class OSPDopenvas(OSPDaemon):
             string: xml element as string.
         """
         _solution = Element('solution')
-        _solution.text = solution
+        try:
+            _solution.text = solution
+        except ValueError as e:
+            logger.warning(
+                "Not possible to parse solution tag for vt %s: %s", vt_id, e
+            )
         if solution_type:
             _solution.set('type', solution_type)
         return tostring(_solution).decode('utf-8')
@@ -729,7 +909,14 @@ class OSPDopenvas(OSPDaemon):
         """
         _detection = Element('detection')
         if vuldetect:
-            _detection.text = vuldetect
+            try:
+                _detection.text = vuldetect
+            except ValueError as e:
+                logger.warning(
+                    "Not possible to parse detection tag for vt %s: %s",
+                    vt_id,
+                    e,
+                )
         if qod_type:
             _detection.set('qod_type', qod_type)
         elif qod:
@@ -853,13 +1040,17 @@ class OSPDopenvas(OSPDaemon):
         res = self.openvas_db.get_result()
         while res:
             msg = res.split('|||')
-            roid = msg[3]
+            roid = msg[3].strip()
             rqod = ''
             rname = ''
-            rhostname = msg[1] if msg[1] else ''
+            rhostname = msg[1].strip() if msg[1] else ''
             host_is_dead = "Host dead" in msg[4]
+            valid_oid = roid and roid in self.vts
 
-            if not host_is_dead:
+            if not valid_oid and not host_is_dead:
+                logger.warning('Invalid VT oid %s for a result', roid)
+
+            if valid_oid and not host_is_dead:
                 if self.vts[roid].get('qod_type'):
                     qod_t = self.vts[roid].get('qod_type')
                     rqod = self.nvti.QOD_TYPES[qod_t]
@@ -876,6 +1067,7 @@ class OSPDopenvas(OSPDaemon):
                     name=rname,
                     value=msg[4],
                     port=msg[2],
+                    test_id=roid,
                 )
 
             if msg[0] == 'LOG':
@@ -1015,6 +1207,12 @@ class OSPDopenvas(OSPDaemon):
                             parent = None
 
                 self.openvas_db.release_db(current_kbi)
+                for host_kb in range(0, self.openvas_db.max_dbindex):
+                    self.openvas_db.select_kb(
+                        ctx, str(host_kb), set_global=True
+                    )
+                    if self.openvas_db.get_single_item('internal/%s' % scan_id):
+                        self.openvas_db.release_db(host_kb)
 
     def get_vts_in_groups(self, filters):
         """ Return a list of vts which match with the given filter.
@@ -1061,7 +1259,6 @@ class OSPDopenvas(OSPDaemon):
         """
         if param_type in [
             'entry',
-            'file',
             'password',
             'radio',
             'sshlogin',
@@ -1070,6 +1267,12 @@ class OSPDopenvas(OSPDaemon):
         elif param_type == 'checkbox' and (
             vt_param_value == '0' or vt_param_value == '1'
         ):
+            return None
+        elif param_type == 'file':
+            try:
+                b64decode(vt_param_value.encode())
+            except (binascii.Error, AttributeError, TypeError):
+                return 1
             return None
         elif param_type == 'integer':
             try:
@@ -1092,8 +1295,7 @@ class OSPDopenvas(OSPDaemon):
         for vtid, vt_params in vts.items():
             if vtid not in self.vts.keys():
                 logger.warning(
-                    'The vt %s was not found and it will not be loaded.',
-                    vtid,
+                    'The vt %s was not found and it will not be loaded.', vtid
                 )
                 continue
             vts_list.append(vtid)
@@ -1102,7 +1304,8 @@ class OSPDopenvas(OSPDaemon):
                 param_name = self.get_vt_param_name(vtid, vt_param_id)
                 if not param_type or not param_name:
                     logger.debug(
-                        'The vt parameter %s for %s could not be loaded.',
+                        'Missing type or name for vt parameter %s of %s. '
+                        'It could not be loaded.',
                         vt_param_id,
                         vtid,
                     )
@@ -1113,7 +1316,10 @@ class OSPDopenvas(OSPDaemon):
                     type_aux = param_type
                 if self.check_param_type(vt_param_value, type_aux):
                     logger.debug(
+                        'The vt parameter %s for %s could not be loaded. '
                         'Expected %s type for parameter value %s',
+                        vt_param_id,
+                        vtid,
                         type_aux,
                         str(vt_param_value),
                     )
@@ -1210,35 +1416,35 @@ class OSPDopenvas(OSPDaemon):
                 cred_prefs_list.append(
                     OID_SNMP_AUTH
                     + ':1:'
-                    + 'password:SNMP Community:'
+                    + 'password:SNMP Community:|||'
                     + '{0}'.format(community)
                 )
                 cred_prefs_list.append(
                     OID_SNMP_AUTH
                     + ':2:'
-                    + 'entry:SNMPv3 Username:'
+                    + 'entry:SNMPv3 Username:|||'
                     + '{0}'.format(username)
                 )
                 cred_prefs_list.append(
                     OID_SNMP_AUTH + ':3:'
-                    'password:SNMPv3 Password:' + '{0}'.format(password)
+                    'password:SNMPv3 Password:|||' + '{0}'.format(password)
                 )
                 cred_prefs_list.append(
                     OID_SNMP_AUTH
                     + ':4:'
-                    + 'radio:SNMPv3 Authentication '
-                    + 'Algorithm:{0}'.format(auth_algorithm)
+                    + 'radio:SNMPv3 Authentication Algorithm:|||'
+                    + '{0}'.format(auth_algorithm)
                 )
                 cred_prefs_list.append(
                     OID_SNMP_AUTH
                     + ':5:'
-                    + 'password:SNMPv3 Privacy Password:'
+                    + 'password:SNMPv3 Privacy Password:|||'
                     + '{0}'.format(privacy_password)
                 )
                 cred_prefs_list.append(
                     OID_SNMP_AUTH
                     + ':6:'
-                    + 'radio:SNMPv3 Privacy Algorithm:'
+                    + 'radio:SNMPv3 Privacy Algorithm:|||'
                     + '{0}'.format(privacy_algorithm)
                 )
 
@@ -1286,9 +1492,7 @@ class OSPDopenvas(OSPDaemon):
         self.openvas_db.add_single_item(
             'internal/%s/globalscanid' % scan_id, [openvas_scan_id]
         )
-        self.openvas_db.add_single_item(
-            'internal/scanid', [openvas_scan_id]
-        )
+        self.openvas_db.add_single_item('internal/scanid', [openvas_scan_id])
 
         exclude_hosts = self.get_scan_exclude_hosts(scan_id, target)
         if exclude_hosts:
@@ -1337,13 +1541,22 @@ class OSPDopenvas(OSPDaemon):
             'internal/%s/scanprefs' % openvas_scan_id, [port_range]
         )
 
+        # If credentials or vts fail, set this variable.
+        do_not_launch = False
+
         # Set credentials
         credentials = self.get_scan_credentials(scan_id, target)
         if credentials:
             cred_prefs = self.build_credentials_as_prefs(credentials)
-            self.openvas_db.add_single_item(
-                'internal/%s/scanprefs' % openvas_scan_id, cred_prefs
-            )
+            if cred_prefs:
+                self.openvas_db.add_single_item(
+                    'internal/%s/scanprefs' % openvas_scan_id, cred_prefs
+                )
+            else:
+                self.add_scan_error(
+                    scan_id, name='', host=target, value='Malformed credential.'
+                )
+                do_not_launch = True
 
         # Set plugins to run
         nvts = self.get_scan_vts(scan_id)
@@ -1362,10 +1575,13 @@ class OSPDopenvas(OSPDaemon):
                     'internal/%s/scanprefs' % openvas_scan_id, [item]
                 )
         else:
-            self.openvas_db.release_db(self.main_kbindex)
             self.add_scan_error(
                 scan_id, name='', host=target, value='No VTS to run.'
             )
+            do_not_launch = True
+
+        if do_not_launch:
+            self.openvas_db.release_db(self.main_kbindex)
             return 2
 
         cmd = ['openvas', '--scan-start', openvas_scan_id]
@@ -1411,6 +1627,7 @@ class OSPDopenvas(OSPDaemon):
 
             ctx = self.openvas_db.kb_connect(self.main_kbindex)
             self.openvas_db.set_redisctx(ctx)
+            self.get_openvas_result(scan_id, "")
             dbs = self.openvas_db.get_list_item('internal/dbindex')
             for i in list(dbs):
                 if i == self.main_kbindex:
@@ -1446,7 +1663,6 @@ class OSPDopenvas(OSPDaemon):
 
         # Delete keys from KB related to this scan task.
         self.openvas_db.release_db(self.main_kbindex)
-        return 1
 
 
 def main():

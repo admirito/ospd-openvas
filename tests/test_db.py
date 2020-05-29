@@ -47,7 +47,9 @@ class TestDB(TestCase):
         # it is none
         self.assertIsNone(self.db.db_address)
         # set the first time
-        mock_subproc.check_output.return_value = 'db_address = /foo/bar'.encode()
+        mock_subproc.check_output.return_value = (
+            'db_address = /foo/bar'.encode()
+        )
         self.db.get_db_connection()
         self.assertEqual(self.db.db_address, "/foo/bar")
 
@@ -88,7 +90,7 @@ class TestDB(TestCase):
         mock_redis.side_effect = RCE
         with patch.object(OpenvasDB, 'get_db_connection', return_value=None):
             with patch.object(time, 'sleep', return_value=None):
-                with self.assertRaises(OspdOpenvasError):
+                with self.assertRaises(SystemExit):
                     self.db.kb_connect()
 
     def test_kb_new_fail(self, mock_redis):
