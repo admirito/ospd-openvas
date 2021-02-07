@@ -1,34 +1,32 @@
 # -*- coding: utf-8 -*-
-# Copyright (C) 2019 Greenbone Networks GmbH
+# Copyright (C) 2014-2021 Greenbone Networks GmbH
 #
-# SPDX-License-Identifier: GPL-2.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-or-later
 #
-# This program is free software; you can redistribute it and/or
-# modify it under the terms of the GNU General Public License
-# as published by the Free Software Foundation; either version 2
-# of the License, or (at your option) any later version.
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
+# GNU Affero General Public License for more details.
 #
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software
-# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA
+# You should have received a copy of the GNU Affero General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+
 
 # pylint: disable=too-many-lines
 
 """ Setup for the OSP OpenVAS Server. """
 
 import logging
-import subprocess
 import time
-import uuid
-import binascii
+import copy
 
+from typing import Optional, Dict, List, Tuple, Iterator
 from datetime import datetime
-from base64 import b64decode
 
 from pathlib import Path
 from os import geteuid
@@ -36,19 +34,26 @@ from lxml.etree import tostring, SubElement, Element
 
 import psutil
 
-from ospd.errors import OspdError
 from ospd.ospd import OSPDaemon
+from ospd.scan import ScanProgress
+from ospd.server import BaseServer
 from ospd.main import main as daemon_main
 from ospd.cvss import CVSS
 from ospd.vtfilter import VtsFilter
+from ospd.resultlist import ResultList
 
 from ospd_openvas import __version__
 from ospd_openvas.errors import OspdOpenvasError
 
 from ospd_openvas.nvticache import NVTICache
-from ospd_openvas.db import OpenvasDB
+from ospd_openvas.db import MainDB, BaseDB, ScanDB
+from ospd_openvas.lock import LockFile
+from ospd_openvas.preferencehandler import PreferenceHandler
+from ospd_openvas.openvas import Openvas
+from ospd_openvas.vthelper import VtHelper
 
 logger = logging.getLogger(__name__)
+
 
 OSPD_DESC = """
 This scanner runs OpenVAS to scan the target hosts.
@@ -72,6 +77,7 @@ OSPD_PARAMS = {
         'name': 'auto_enable_dependencies',
         'default': 1,
         'mandatory': 1,
+        'visible_for_client': True,
         'description': 'Automatically enable the plugins that are depended on',
     },
     'cgi_path': {
@@ -79,6 +85,7 @@ OSPD_PARAMS = {
         'name': 'cgi_path',
         'default': '/cgi-bin:/scripts',
         'mandatory': 1,
+        'visible_for_client': True,
         'description': 'Look for default CGIs in /cgi-bin and /scripts',
     },
     'checks_read_timeout': {
@@ -86,30 +93,18 @@ OSPD_PARAMS = {
         'name': 'checks_read_timeout',
         'default': 5,
         'mandatory': 1,
+        'visible_for_client': True,
         'description': (
             'Number  of seconds that the security checks will '
             + 'wait for when doing a recv()'
         ),
-    },
-    'drop_privileges': {
-        'type': 'boolean',
-        'name': 'drop_privileges',
-        'default': 0,
-        'mandatory': 1,
-        'description': '',
-    },
-    'network_scan': {
-        'type': 'boolean',
-        'name': 'network_scan',
-        'default': 0,
-        'mandatory': 1,
-        'description': '',
     },
     'non_simult_ports': {
         'type': 'string',
         'name': 'non_simult_ports',
         'default': '139, 445, 3389, Services/irc',
         'mandatory': 1,
+        'visible_for_client': True,
         'description': (
             'Prevent to make two connections on the same given '
             + 'ports at the same time.'
@@ -120,6 +115,7 @@ OSPD_PARAMS = {
         'name': 'open_sock_max_attempts',
         'default': 5,
         'mandatory': 0,
+        'visible_for_client': True,
         'description': (
             'Number of unsuccessful retries to open the socket '
             + 'before to set the port as closed.'
@@ -130,17 +126,27 @@ OSPD_PARAMS = {
         'name': 'timeout_retry',
         'default': 5,
         'mandatory': 0,
+        'visible_for_client': True,
         'description': (
             'Number of retries when a socket connection attempt ' + 'timesout.'
         ),
     },
     'optimize_test': {
-        'type': 'integer',
+        'type': 'boolean',
         'name': 'optimize_test',
-        'default': 5,
+        'default': 1,
         'mandatory': 0,
+        'visible_for_client': True,
         'description': (
-            'By default, openvas does not trust the remote ' + 'host banners.'
+            'By default, optimize_test is enabled which means openvas does '
+            + 'trust the remote host banners and is only launching plugins '
+            + 'against the services they have been designed to check. '
+            + 'For example it will check a web server claiming to be IIS only '
+            + 'for IIS related flaws but will skip plugins testing for Apache '
+            + 'flaws, and so on. This default behavior is used to optimize '
+            + 'the scanning performance and to avoid false positives. '
+            + 'If you are not sure that the banners of the remote host '
+            + 'have been tampered with, you can disable this option.'
         ),
     },
     'plugins_timeout': {
@@ -148,6 +154,7 @@ OSPD_PARAMS = {
         'name': 'plugins_timeout',
         'default': 5,
         'mandatory': 0,
+        'visible_for_client': True,
         'description': 'This is the maximum lifetime, in seconds of a plugin.',
     },
     'report_host_details': {
@@ -155,6 +162,7 @@ OSPD_PARAMS = {
         'name': 'report_host_details',
         'default': 1,
         'mandatory': 1,
+        'visible_for_client': True,
         'description': '',
     },
     'safe_checks': {
@@ -162,6 +170,7 @@ OSPD_PARAMS = {
         'name': 'safe_checks',
         'default': 1,
         'mandatory': 1,
+        'visible_for_client': True,
         'description': (
             'Disable the plugins with potential to crash '
             + 'the remote services'
@@ -172,6 +181,7 @@ OSPD_PARAMS = {
         'name': 'scanner_plugins_timeout',
         'default': 36000,
         'mandatory': 1,
+        'visible_for_client': True,
         'description': 'Like plugins_timeout, but for ACT_SCANNER plugins.',
     },
     'time_between_request': {
@@ -179,6 +189,7 @@ OSPD_PARAMS = {
         'name': 'time_between_request',
         'default': 0,
         'mandatory': 0,
+        'visible_for_client': True,
         'description': (
             'Allow to set a wait time between two actions '
             + '(open, send, close).'
@@ -189,6 +200,7 @@ OSPD_PARAMS = {
         'name': 'unscanned_closed',
         'default': 1,
         'mandatory': 1,
+        'visible_for_client': True,
         'description': '',
     },
     'unscanned_closed_udp': {
@@ -196,6 +208,7 @@ OSPD_PARAMS = {
         'name': 'unscanned_closed_udp',
         'default': 1,
         'mandatory': 1,
+        'visible_for_client': True,
         'description': '',
     },
     'expand_vhosts': {
@@ -203,6 +216,7 @@ OSPD_PARAMS = {
         'name': 'expand_vhosts',
         'default': 1,
         'mandatory': 0,
+        'visible_for_client': True,
         'description': 'Whether to expand the target hosts '
         + 'list of vhosts with values gathered from sources '
         + 'such as reverse-lookup queries and VT checks '
@@ -213,36 +227,210 @@ OSPD_PARAMS = {
         'name': 'test_empty_vhost',
         'default': 0,
         'mandatory': 0,
+        'visible_for_client': True,
         'description': 'If  set  to  yes, the scanner will '
         + 'also test the target by using empty vhost value '
         + 'in addition to the targets associated vhost values.',
     },
+    'max_hosts': {
+        'type': 'integer',
+        'name': 'max_hosts',
+        'default': 30,
+        'mandatory': 0,
+        'visible_for_client': False,
+        'description': (
+            'The maximum number of hosts to test at the same time which '
+            + 'should be given to the client (which can override it). '
+            + 'This value must be computed given your bandwidth, '
+            + 'the number of hosts you want to test, your amount of '
+            + 'memory and the performance of your processor(s).'
+        ),
+    },
+    'max_checks': {
+        'type': 'integer',
+        'name': 'max_checks',
+        'default': 10,
+        'mandatory': 0,
+        'visible_for_client': False,
+        'description': (
+            'The number of plugins that will run against each host being '
+            + 'tested. Note that the total number of process will be max '
+            + 'checks x max_hosts so you need to find a balance between '
+            + 'these two options. Note that launching too many plugins at '
+            + 'the same time may disable the remote host, either temporarily '
+            + '(ie: inetd closes its ports) or definitely (the remote host '
+            + 'crash because it is asked to do too many things at the '
+            + 'same time), so be careful.'
+        ),
+    },
+    'port_range': {
+        'type': 'string',
+        'name': 'port_range',
+        'default': '',
+        'mandatory': 0,
+        'visible_for_client': False,
+        'description': (
+            'This is the default range of ports that the scanner plugins will '
+            + 'probe. The syntax of this option is flexible, it can be a '
+            + 'single range ("1-1500"), several ports ("21,23,80"), several '
+            + 'ranges of ports ("1-1500,32000-33000"). Note that you can '
+            + 'specify UDP and TCP ports by prefixing each range by T or U. '
+            + 'For instance, the following range will make openvas scan UDP '
+            + 'ports 1 to 1024 and TCP ports 1 to 65535 : '
+            + '"T:1-65535,U:1-1024".'
+        ),
+    },
+    'test_alive_hosts_only': {
+        'type': 'boolean',
+        'name': 'test_alive_hosts_only',
+        'default': 0,
+        'mandatory': 0,
+        'visible_for_client': False,
+        'description': (
+            'If this option is set, openvas will scan the target list for '
+            + 'alive hosts in a separate process while only testing those '
+            + 'hosts which are identified as alive. This boosts the scan '
+            + 'speed of target ranges with a high amount of dead hosts '
+            + 'significantly.'
+        ),
+    },
+    'source_iface': {
+        'type': 'string',
+        'name': 'source_iface',
+        'default': '',
+        'mandatory': 0,
+        'visible_for_client': False,
+        'description': (
+            'Name of the network interface that will be used as the source '
+            + 'of connections established by openvas. The scan won\'t be '
+            + 'launched if the value isn\'t authorized according to '
+            + '(sys_)ifaces_allow / (sys_)ifaces_deny if present.'
+        ),
+    },
+    'ifaces_allow': {
+        'type': 'string',
+        'name': 'ifaces_allow',
+        'default': '',
+        'mandatory': 0,
+        'visible_for_client': False,
+        'description': (
+            'Comma-separated list of interfaces names that are authorized '
+            + 'as source_iface values.'
+        ),
+    },
+    'ifaces_deny': {
+        'type': 'string',
+        'name': 'ifaces_deny',
+        'default': '',
+        'mandatory': 0,
+        'visible_for_client': False,
+        'description': (
+            'Comma-separated list of interfaces names that are not '
+            + 'authorized as source_iface values.'
+        ),
+    },
+    'hosts_allow': {
+        'type': 'string',
+        'name': 'hosts_allow',
+        'default': '',
+        'mandatory': 0,
+        'visible_for_client': False,
+        'description': (
+            'Comma-separated list of the only targets that are authorized '
+            + 'to be scanned. Supports the same syntax as the list targets. '
+            + 'Both target hostnames and the address to which they resolve '
+            + 'are checked. Hostnames in hosts_allow list are not resolved '
+            + 'however.'
+        ),
+    },
+    'hosts_deny': {
+        'type': 'string',
+        'name': 'hosts_deny',
+        'default': '',
+        'mandatory': 0,
+        'visible_for_client': False,
+        'description': (
+            'Comma-separated list of targets that are not authorized to '
+            + 'be scanned. Supports the same syntax as the list targets. '
+            + 'Both target hostnames and the address to which they resolve '
+            + 'are checked. Hostnames in hosts_deny list are not '
+            + 'resolved however.'
+        ),
+    },
 }
 
-OID_SSH_AUTH = "1.3.6.1.4.1.25623.1.0.103591"
-OID_SMB_AUTH = "1.3.6.1.4.1.25623.1.0.90023"
-OID_ESXI_AUTH = "1.3.6.1.4.1.25623.1.0.105058"
-OID_SNMP_AUTH = "1.3.6.1.4.1.25623.1.0.105076"
+VT_BASE_OID = "1.3.6.1.4.1.25623."
 
 
-def _from_bool_to_str(value):
-    """ The OpenVAS scanner use yes and no as boolean values, whereas ospd
-    uses 1 and 0."""
-    return 'yes' if value == 1 else 'no'
+def safe_int(value: str) -> Optional[int]:
+    """Convert a string into an integer and return None in case of errors
+    during conversion
+    """
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return None
 
 
 class OpenVasVtsFilter(VtsFilter):
-    """ Methods to overwrite the ones in the original class.
-    Each method formats the value to be compatible with the filter
-    """
 
-    def format_vt_modification_time(self, value):
-        """ Convert the string seconds since epoch into a 19 character
+    """Methods to overwrite the ones in the original class."""
+
+    def __init__(self, nvticache: NVTICache) -> None:
+        super().__init__()
+
+        self.nvti = nvticache
+
+    def format_vt_modification_time(self, value: str) -> str:
+        """Convert the string seconds since epoch into a 19 character
         string representing YearMonthDayHourMinuteSecond,
         e.g. 20190319122532. This always refers to UTC.
         """
 
         return datetime.utcfromtimestamp(int(value)).strftime("%Y%m%d%H%M%S")
+
+    def get_filtered_vts_list(self, vts, vt_filter: str) -> Optional[List[str]]:
+        """Gets a collection of vulnerability test from the redis cache,
+        which match the filter.
+
+        Arguments:
+            vt_filter: Filter to apply to the vts collection.
+            vts: The complete vts collection.
+
+        Returns:
+            List with filtered vulnerability tests. The list can be empty.
+            None in case of filter parse failure.
+        """
+        filters = self.parse_filters(vt_filter)
+        if not filters:
+            return None
+
+        if not self.nvti:
+            return None
+
+        vt_oid_list = [vtlist[1] for vtlist in self.nvti.get_oids()]
+        vt_oid_list_temp = copy.copy(vt_oid_list)
+        vthelper = VtHelper(self.nvti)
+
+        for element, oper, filter_val in filters:
+            for vt_oid in vt_oid_list_temp:
+                if vt_oid not in vt_oid_list:
+                    continue
+
+                vt = vthelper.get_single_vt(vt_oid)
+                if vt is None or not vt.get(element):
+                    vt_oid_list.remove(vt_oid)
+                    continue
+
+                elem_val = vt.get(element)
+                val = self.format_filter_value(element, elem_val)
+
+                if self.filter_operator[oper](val, filter_val):
+                    continue
+                else:
+                    vt_oid_list.remove(vt_oid)
+
+        return vt_oid_list
 
 
 class OSPDopenvas(OSPDaemon):
@@ -253,90 +441,73 @@ class OSPDopenvas(OSPDaemon):
         self, *, niceness=None, lock_file_dir='/var/run/ospd', **kwargs
     ):
         """ Initializes the ospd-openvas daemon's internal data. """
+        self.main_db = MainDB()
+        self.nvti = NVTICache(self.main_db)
 
-        super().__init__(customvtfilter=OpenVasVtsFilter(), **kwargs)
+        super().__init__(
+            customvtfilter=OpenVasVtsFilter(self.nvti),
+            storage=dict,
+            file_storage_dir=lock_file_dir,
+            **kwargs,
+        )
 
         self.server_version = __version__
 
         self._niceness = str(niceness)
 
-        self.feed_lock_file = Path(lock_file_dir) / 'feed-update.lock'
+        self.feed_lock = LockFile(Path(lock_file_dir) / 'feed-update.lock')
+        self.daemon_info['name'] = 'OSPd OpenVAS'
         self.scanner_info['name'] = 'openvas'
-        self.scanner_info['version'] = ''  # achieved during self.check()
+        self.scanner_info['version'] = ''  # achieved during self.init()
         self.scanner_info['description'] = OSPD_DESC
 
         for name, param in OSPD_PARAMS.items():
-            self.add_scanner_param(name, param)
+            self.set_scanner_param(name, param)
 
         self._sudo_available = None
         self._is_running_as_root = None
 
         self.scan_only_params = dict()
 
-        self.main_kbindex = None
+    def init(self, server: BaseServer) -> None:
 
-        self.openvas_db = OpenvasDB()
+        self.scan_collection.init()
 
-        self.nvti = NVTICache(self.openvas_db)
+        server.start(self.handle_client_stream)
 
-        self.pending_feed = None
+        self.scanner_info['version'] = Openvas.get_version()
 
-    def init(self):
-        self.openvas_db.db_init()
+        self.set_params_from_openvas_settings()
 
-        ctx = self.nvti.get_redis_context()
+        with self.feed_lock.wait_for_lock():
+            Openvas.load_vts_into_redis()
+            current_feed = self.nvti.get_feed_version()
+            self.set_vts_version(vts_version=current_feed)
 
-        if not ctx:
-            while not self.create_feed_lock_file():
-                time.sleep(10)
-            self.redis_nvticache_init()
-            self.delete_feed_lock_file()
-            ctx = self.nvti.get_redis_context()
+            logger.debug("Calculating vts integrity check hash...")
+            vthelper = VtHelper(self.nvti)
+            self.vts.sha256_hash = vthelper.calculate_vts_collection_hash()
 
-        self.openvas_db.set_redisctx(ctx)
+        self.initialized = True
 
-        self.load_vts()
+    def set_params_from_openvas_settings(self):
+        """Set OSPD_PARAMS with the params taken from the openvas executable."""
+        param_list = Openvas.get_settings()
 
-    def parse_param(self):
-        """ Set OSPD_PARAMS with the params taken from the openvas_scanner. """
-        bool_dict = {'no': 0, 'yes': 1}
-
-        result = subprocess.check_output(
-            ['openvas', '-s'], stderr=subprocess.STDOUT
-        )
-        result = result.decode('ascii')
-        param_list = dict()
-        for conf in result.split('\n'):
-            elem = conf.split('=')
-            if len(elem) == 2:
-                value = str.strip(elem[1])
-                if str.strip(elem[1]) in bool_dict:
-                    value = bool_dict[value]
-                param_list[str.strip(elem[0])] = value
-        for elem in OSPD_PARAMS:
-            if elem in param_list:
-                OSPD_PARAMS[elem]['default'] = param_list[elem]
         for elem in param_list:
             if elem not in OSPD_PARAMS:
                 self.scan_only_params[elem] = param_list[elem]
+            else:
+                OSPD_PARAMS[elem]['default'] = param_list[elem]
 
-    def redis_nvticache_init(self):
-        """ Loads NVT's metadata into Redis DB. """
-        try:
-            logger.debug('Loading NVTs in Redis DB')
-            subprocess.check_call(['openvas', '--update-vt-info'])
-        except subprocess.CalledProcessError as err:
-            logger.error('OpenVAS Scanner failed to load NVTs. %s', err)
-
-    def feed_is_outdated(self, current_feed):
-        """ Compare the current feed with the one in the disk.
+    def feed_is_outdated(self, current_feed: str) -> Optional[bool]:
+        """Compare the current feed with the one in the disk.
 
         Return:
             False if there is no new feed.
             True if the feed version in disk is newer than the feed in
-            redis cache.
-            None if there is no feed
-            the disk.
+                redis cache.
+            None if there is no feed on the disk.
         """
         plugins_folder = self.scan_only_params.get('plugins_folder')
         if not plugins_folder:
@@ -344,286 +515,88 @@ class OSPDopenvas(OSPDaemon):
 
         feed_info_file = Path(plugins_folder) / 'plugin_feed_info.inc'
         if not feed_info_file.exists():
-            self.parse_param()
-            msg = 'Plugins feed file %s not found.' % feed_info_file
-            logger.debug(msg)
+            self.set_params_from_openvas_settings()
+            logger.debug('Plugins feed file %s not found.', feed_info_file)
             return None
 
-        date = 0
-        with open(str(feed_info_file)) as fcontent:
+        current_feed = safe_int(current_feed)
+        if current_feed is None:
+            logger.debug(
+                "Wrong PLUGIN_SET format in plugins feed file %s. Format has to"
+                " be yyyymmddhhmm. For example 'PLUGIN_SET = \"201910251033\"'",
+                feed_info_file,
+            )
+
+        feed_date = None
+        with feed_info_file.open() as fcontent:
             for line in fcontent:
                 if "PLUGIN_SET" in line:
-                    date = line.split(' = ')[1]
-                    date = date.replace(';', '')
-                    date = date.replace('"', '')
-        if int(current_feed) < int(date) or int(date) == 0:
-            return True
-        return False
+                    feed_date = line.split('=', 1)[1]
+                    feed_date = feed_date.strip()
+                    feed_date = feed_date.replace(';', '')
+                    feed_date = feed_date.replace('"', '')
+                    feed_date = safe_int(feed_date)
+                    break
 
-    def feed_locked(self):
-        """ Check if there is an already lock file set for the feed. """
-        if self.feed_lock_file.is_file():
-            logger.info(
-                "A feed update process is running. Trying again later..."
-            )
-            return True
+        logger.debug("Current feed version: %s", current_feed)
+        logger.debug("Plugin feed version: %s", feed_date)
 
-        return False
-
-    def create_feed_lock_file(self):
-        """ Create a lock file.
-            Return: True in success, False otherwise.
-        """
-        if self.feed_locked():
-            return False
-        else:
-            try:
-                with self.feed_lock_file.open('w') as f:
-                    f.write("locked")
-            except (FileNotFoundError, PermissionError) as e:
-                logger.error(
-                    "Failed to create feed lock file %s. %s",
-                    self.feed_lock_file,
-                    e,
-                )
-                return False
-
-        return True
-
-    def delete_feed_lock_file(self):
-        """ Delete the feed lock file.
-        """
-        if self.feed_lock_file.is_file():
-            self.feed_lock_file.unlink()
-            logger.debug("Feed lock file removed.")
+        return (
+            (not feed_date) or (not current_feed) or (current_feed < feed_date)
+        )
 
     def check_feed(self):
-        """ Check if there is a feed update. Wait until all the running
-        scans finished. Set a flag to anounce there is a pending feed update,
-        which avoid to start a new scan.
+        """Check if there is a feed update.
+
+        Wait until all the running scans finished. Set a flag to announce there
+        is a pending feed update, which avoids to start a new scan.
         """
-        if not self.is_cache_available:
+        if not self.vts.is_cache_available:
             return
 
         current_feed = self.nvti.get_feed_version()
-        # Check if the feed is already accessible in the disk.
-        if current_feed and self.feed_is_outdated(current_feed) is None:
-            self.pending_feed = True
-            return
+        is_outdated = self.feed_is_outdated(current_feed)
 
         # Check if the nvticache in redis is outdated
-        if not current_feed or self.feed_is_outdated(current_feed):
-            self.pending_feed = True
-            if self.create_feed_lock_file():
-                self.is_cache_available = False
-                self.redis_nvticache_init()
-                ctx = self.nvti.get_redis_context()
-                self.openvas_db.set_redisctx(ctx)
-                self.delete_feed_lock_file()
-                self.is_cache_available = True
-            else:
-                logger.debug(
-                    "The feed was not upload or it is outdated, "
-                    "but other process is locking the update. "
-                    "Trying again later..."
-                )
-                return
+        if not current_feed or is_outdated:
+            with self.feed_lock as fl:
+                if fl.has_lock():
+                    self.initialized = False
+                    Openvas.load_vts_into_redis()
+                    current_feed = self.nvti.get_feed_version()
+                    self.set_vts_version(vts_version=current_feed)
 
-        _running_scan = False
-        for scan_id in self.scan_processes:
-            if self.scan_processes[scan_id].is_alive():
-                _running_scan = True
-
-        # Check if the NVT dict is outdated
-        if self.pending_feed:
-            _pending_feed = True
-        else:
-            _pending_feed = (
-                self.get_vts_version() != self.nvti.get_feed_version()
-            )
-
-        if _pending_feed and (_running_scan or self.feed_locked()):
-            if not self.pending_feed:
-                self.pending_feed = True
-                logger.info(
-                    'There is a running process blocking the feed update. '
-                    'Therefore the feed update will be performed later.'
-                )
-        elif _pending_feed and not _running_scan and not self.feed_locked():
-            self.vts = dict()
-            self.load_vts()
+                    vthelper = VtHelper(self.nvti)
+                    self.vts.sha256_hash = (
+                        vthelper.calculate_vts_collection_hash()
+                    )
+                    self.initialized = True
+                else:
+                    logger.debug(
+                        "The feed was not upload or it is outdated, "
+                        "but other process is locking the update. "
+                        "Trying again later..."
+                    )
+                    return
 
     def scheduler(self):
         """This method is called periodically to run tasks."""
         self.check_feed()
 
-    def get_single_vt(self, vt_id, oids):
-        _vt_params = self.nvti.get_nvt_params(vt_id)
-        _vt_refs = self.nvti.get_nvt_refs(vt_id)
-        _custom = self.nvti.get_nvt_metadata(vt_id)
-
-        _name = _custom.pop('name')
-        _vt_creation_time = _custom.pop('creation_date')
-        _vt_modification_time = _custom.pop('last_modification')
-
-        _vt_dependencies = list()
-        if 'dependencies' in _custom:
-            _deps = _custom.pop('dependencies')
-            _deps_list = _deps.split(', ')
-            for dep in _deps_list:
-                _vt_dependencies.append(oids.get('filename:' + dep))
-
-        _summary = None
-        _impact = None
-        _affected = None
-        _insight = None
-        _solution = None
-        _solution_t = None
-        _vuldetect = None
-        _qod_t = None
-        _qod_v = None
-
-        if 'summary' in _custom:
-            _summary = _custom.pop('summary')
-        if 'impact' in _custom:
-            _impact = _custom.pop('impact')
-        if 'affected' in _custom:
-            _affected = _custom.pop('affected')
-        if 'insight' in _custom:
-            _insight = _custom.pop('insight')
-        if 'solution' in _custom:
-            _solution = _custom.pop('solution')
-            if 'solution_type' in _custom:
-                _solution_t = _custom.pop('solution_type')
-
-        if 'vuldetect' in _custom:
-            _vuldetect = _custom.pop('vuldetect')
-        if 'qod_type' in _custom:
-            _qod_t = _custom.pop('qod_type')
-        elif 'qod' in _custom:
-            _qod_v = _custom.pop('qod')
-
-        _severity = dict()
-        if 'severity_base_vector' in _custom:
-            _severity_vector = _custom.pop('severity_base_vector')
-        else:
-            _severity_vector = _custom.pop('cvss_base_vector')
-        _severity['severity_base_vector'] = _severity_vector
-        if 'severity_type' in _custom:
-            _severity_type = _custom.pop('severity_type')
-        else:
-            _severity_type = 'cvss_base_v2'
-        _severity['severity_type'] = _severity_type
-        if 'severity_origin' in _custom:
-            _severity['severity_origin'] = _custom.pop('severity_origin')
-
-        if _name is None:
-            _name = ''
-
-        vt = {'name': _name}
-        if _custom is not None:
-            vt["custom"] = _custom
-        if _vt_params is not None:
-            vt["vt_params"] = _vt_params
-        if _vt_refs is not None:
-            vt["vt_refs"] = _vt_refs
-        if _vt_dependencies is not None:
-            vt["vt_dependencies"] = _vt_dependencies
-        if _vt_creation_time is not None:
-            vt["creation_time"] = _vt_creation_time
-        if _vt_modification_time is not None:
-            vt["modification_time"] = _vt_modification_time
-        if _summary is not None:
-            vt["summary"] = _summary
-        if _impact is not None:
-            vt["impact"] = _impact
-        if _affected is not None:
-            vt["affected"] = _affected
-        if _insight is not None:
-            vt["insight"] = _insight
-
-        if _solution is not None:
-            vt["solution"] = _solution
-            if _solution_t is not None:
-                vt["solution_type"] = _solution_t
-
-        if _vuldetect is not None:
-            vt["detection"] = _vuldetect
-
-        if _qod_t is not None:
-            vt["qod_type"] = _qod_t
-        elif _qod_v is not None:
-            vt["qod"] = _qod_v
-
-        if _severity is not None:
-            vt["severities"] = _severity
-
-        return vt
-
-    def get_vt_iterator(self):
-        """ Yield the vts from the Redis NVTicache. """
-        oids = dict(self.nvti.get_oids())
-        for _, vt_id in oids.items():
-            vt = self.get_single_vt(vt_id, oids)
-            yield (vt_id, vt)
-
-    def load_vts(self):
-        """ Load the NVT's metadata into the vts
-        global  dictionary. """
-        self.is_cache_available = False
-
-        if not self.create_feed_lock_file():
-            logger.warning(
-                'Error creating feed lock file. Trying again later...'
-            )
-            return
-
-        logger.info('Loading vts in memory.')
-        oids = dict(self.nvti.get_oids())
-        for _, vt_id in oids.items():
-            vt = self.get_single_vt(vt_id, oids)
-
-            if (
-                not vt
-                or vt.get('vt_params') is None
-                or vt.get('custom') is None
-            ):
-                logger.warning(
-                    'Error loading VTs in memory. Trying again later...'
-                )
-                return
-
-            custom = {'family': vt['custom'].get('family')}
-            try:
-                self.add_vt(
-                    vt_id,
-                    name=vt.get('name'),
-                    qod_t=vt.get('qod_type'),
-                    qod_v=vt.get('qod'),
-                    severities=vt.get('severities'),
-                    vt_modification_time=vt.get('modification_time'),
-                    vt_params=vt.get('vt_params'),
-                    custom=custom,
-                )
-            except OspdError as e:
-                logger.info("Error while adding vt. %s", e)
-
-        _feed_version = self.nvti.get_feed_version()
-        self.set_vts_version(vts_version=_feed_version)
-        self.delete_feed_lock_file()
-        self.is_cache_available = True
-        self.pending_feed = False
-
-        logger.info('Finish loading up vts.')
+    def get_vt_iterator(
+        self, vt_selection: List[str] = None, details: bool = True
+    ) -> Iterator[Tuple[str, Dict]]:
+        vthelper = VtHelper(self.nvti)
+        return vthelper.get_vt_iterator(vt_selection, details)
 
     @staticmethod
-    def get_custom_vt_as_xml_str(vt_id, custom):
-        """ Return an xml element with custom metadata formatted as string.
+    def get_custom_vt_as_xml_str(vt_id: str, custom: Dict) -> str:
+        """Return an xml element with custom metadata formatted as string.
         Arguments:
-            vt_id (str): VT OID. Only used for logging in error case.
-            custom (dict): Dictionary with the custom metadata.
+            vt_id: VT OID. Only used for logging in error case.
+            custom: Dictionary with the custom metadata.
         Return:
-            string: xml element as string.
+            Xml element as string.
         """
 
         _custom = Element('custom')
@@ -633,18 +606,18 @@ class OSPDopenvas(OSPDaemon):
                 xml_key.text = val
             except ValueError as e:
                 logger.warning(
-                    "Not possible to parse custom tag for vt %s: %s", vt_id, e
+                    "Not possible to parse custom tag for VT %s: %s", vt_id, e
                 )
         return tostring(_custom).decode('utf-8')
 
     @staticmethod
-    def get_severities_vt_as_xml_str(vt_id, severities):
-        """ Return an xml element with severities as string.
+    def get_severities_vt_as_xml_str(vt_id: str, severities: Dict) -> str:
+        """Return an xml element with severities as string.
         Arguments:
-            vt_id (str): VT OID. Only used for logging in error case.
-            severities (dict): Dictionary with the severities.
+            vt_id: VT OID. Only used for logging in error case.
+            severities: Dictionary with the severities.
         Return:
-            string: xml element as string.
+            Xml element as string.
         """
         _severities = Element('severities')
         _severity = SubElement(_severities, 'severity')
@@ -663,13 +636,13 @@ class OSPDopenvas(OSPDaemon):
         return tostring(_severities).decode('utf-8')
 
     @staticmethod
-    def get_params_vt_as_xml_str(vt_id, vt_params):
-        """ Return an xml element with params formatted as string.
+    def get_params_vt_as_xml_str(vt_id: str, vt_params: Dict) -> str:
+        """Return an xml element with params formatted as string.
         Arguments:
-            vt_id (str): VT OID. Only used for logging in error case.
-            vt_params (dict): Dictionary with the VT parameters.
+            vt_id: VT OID. Only used for logging in error case.
+            vt_params: Dictionary with the VT parameters.
         Return:
-            string: xml element as string.
+            Xml element as string.
         """
         vt_params_xml = Element('params')
         for _pref_id, prefs in vt_params.items():
@@ -681,7 +654,7 @@ class OSPDopenvas(OSPDaemon):
                 xml_name.text = prefs['name']
             except ValueError as e:
                 logger.warning(
-                    "Not possible to parse parameter for vt %s: %s", vt_id, e
+                    "Not possible to parse parameter for VT %s: %s", vt_id, e
                 )
             if prefs['default']:
                 xml_def = SubElement(vt_param, 'default')
@@ -689,7 +662,7 @@ class OSPDopenvas(OSPDaemon):
                     xml_def.text = prefs['default']
                 except ValueError as e:
                     logger.warning(
-                        "Not possible to parse default parameter for vt %s: %s",
+                        "Not possible to parse default parameter for VT %s: %s",
                         vt_id,
                         e,
                     )
@@ -698,13 +671,13 @@ class OSPDopenvas(OSPDaemon):
         return tostring(vt_params_xml).decode('utf-8')
 
     @staticmethod
-    def get_refs_vt_as_xml_str(vt_id, vt_refs):
-        """ Return an xml element with references formatted as string.
+    def get_refs_vt_as_xml_str(vt_id: str, vt_refs: Dict) -> str:
+        """Return an xml element with references formatted as string.
         Arguments:
-            vt_id (str): VT OID. Only used for logging in error case.
-            vt_refs (dict): Dictionary with the VT references.
+            vt_id: VT OID. Only used for logging in error case.
+            vt_refs: Dictionary with the VT references.
         Return:
-            string: xml element as string.
+            Xml element as string.
         """
         vt_refs_xml = Element('refs')
         for ref_type, ref_values in vt_refs.items():
@@ -714,11 +687,12 @@ class OSPDopenvas(OSPDaemon):
                     for xref in value.split(', '):
                         try:
                             _type, _id = xref.split(':', 1)
-                        except ValueError:
+                        except ValueError as e:
                             logger.error(
-                                'Not possible to parse xref %s for vt %s',
+                                'Not possible to parse xref "%s" for VT %s: %s',
                                 xref,
                                 vt_id,
+                                e,
                             )
                             continue
                         vt_ref.set('type', _type.lower())
@@ -734,23 +708,23 @@ class OSPDopenvas(OSPDaemon):
 
     @staticmethod
     def get_dependencies_vt_as_xml_str(
-        vt_id, dep_list
-    ):  # pylint: disable=arguments-differ
-        """ Return  an xml element with dependencies as string.
+        vt_id: str, vt_dependencies: List
+    ) -> str:
+        """Return  an xml element with dependencies as string.
         Arguments:
-            vt_id (str): VT OID. Only used for logging in error case.
-            dep_list (List): List with the VT dependencies.
+            vt_id: VT OID. Only used for logging in error case.
+            vt_dependencies: List with the VT dependencies.
         Return:
-            string: xml element as string.
+            Xml element as string.
         """
         vt_deps_xml = Element('dependencies')
-        for dep in dep_list:
+        for dep in vt_dependencies:
             _vt_dep = Element('dependency')
-            try:
+            if VT_BASE_OID in dep:
                 _vt_dep.set('vt_id', dep)
-            except (ValueError, TypeError):
+            else:
                 logger.error(
-                    'Not possible to add dependency %s for vt %s', dep, vt_id
+                    'Not possible to add dependency %s for VT %s', dep, vt_id
                 )
                 continue
             vt_deps_xml.append(_vt_dep)
@@ -759,67 +733,67 @@ class OSPDopenvas(OSPDaemon):
 
     @staticmethod
     def get_creation_time_vt_as_xml_str(
-        vt_id, creation_time
-    ):  # pylint: disable=arguments-differ
-        """ Return creation time as string.
+        vt_id: str, vt_creation_time: str
+    ) -> str:
+        """Return creation time as string.
         Arguments:
-            vt_id (str): VT OID. Only used for logging in error case.
-            creation_time (str): String with the VT creation time.
+            vt_id: VT OID. Only used for logging in error case.
+            vt_creation_time: String with the VT creation time.
         Return:
-            string: xml element as string.
+           Xml element as string.
         """
         _time = Element('creation_time')
         try:
-            _time.text = creation_time
+            _time.text = vt_creation_time
         except ValueError as e:
             logger.warning(
-                "Not possible to parse creation time for vt %s: %s", vt_id, e
+                "Not possible to parse creation time for VT %s: %s", vt_id, e
             )
         return tostring(_time).decode('utf-8')
 
     @staticmethod
     def get_modification_time_vt_as_xml_str(
-        vt_id, modification_time
-    ):  # pylint: disable=arguments-differ
-        """ Return modification time as string.
+        vt_id: str, vt_modification_time: str
+    ) -> str:
+        """Return modification time as string.
         Arguments:
-            vt_id (str): VT OID. Only used for logging in error case.
-            modification_time (str): String with the VT modification time.
+            vt_id: VT OID. Only used for logging in error case.
+            vt_modification_time: String with the VT modification time.
         Return:
-            string: xml element as string.
+            Xml element as string.
         """
         _time = Element('modification_time')
         try:
-            _time.text = modification_time
+            _time.text = vt_modification_time
         except ValueError as e:
             logger.warning(
-                "Not possible to parse modification time for vt %s: %s",
+                "Not possible to parse modification time for VT %s: %s",
                 vt_id,
                 e,
             )
         return tostring(_time).decode('utf-8')
 
     @staticmethod
-    def get_summary_vt_as_xml_str(vt_id, summary):
-        """ Return summary as string.
+    def get_summary_vt_as_xml_str(vt_id: str, summary: str) -> str:
+        """Return summary as string.
         Arguments:
-            vt_id (str): VT OID. Only used for logging in error case.
-            summary (str): String with a VT summary.
+            vt_id: VT OID. Only used for logging in error case.
+            summary: String with a VT summary.
         Return:
-            string: xml element as string.
+            Xml element as string.
         """
         _summary = Element('summary')
         try:
             _summary.text = summary
         except ValueError as e:
             logger.warning(
-                "Not possible to parse summary tag for vt %s: %s", vt_id, e
+                "Not possible to parse summary tag for VT %s: %s", vt_id, e
             )
         return tostring(_summary).decode('utf-8')
 
     @staticmethod
-    def get_impact_vt_as_xml_str(vt_id, impact):
-        """ Return impact as string.
+    def get_impact_vt_as_xml_str(vt_id: str, impact) -> str:
+        """Return impact as string.
 
         Arguments:
             vt_id (str): VT OID. Only used for logging in error case.
@@ -832,88 +806,99 @@ class OSPDopenvas(OSPDaemon):
             _impact.text = impact
         except ValueError as e:
             logger.warning(
-                "Not possible to parse impact tag for vt %s: %s", vt_id, e
+                "Not possible to parse impact tag for VT %s: %s", vt_id, e
             )
         return tostring(_impact).decode('utf-8')
 
     @staticmethod
-    def get_affected_vt_as_xml_str(vt_id, affected):
-        """ Return affected as string.
+    def get_affected_vt_as_xml_str(vt_id: str, affected: str) -> str:
+        """Return affected as string.
         Arguments:
-            vt_id (str): VT OID. Only used for logging in error case.
-            affected (str): String which explain what is affected.
+            vt_id: VT OID. Only used for logging in error case.
+            affected: String which explain what is affected.
         Return:
-            string: xml element as string.
+            Xml element as string.
         """
         _affected = Element('affected')
         try:
             _affected.text = affected
         except ValueError as e:
             logger.warning(
-                "Not possible to parse affected tag for vt %s: %s", vt_id, e
+                "Not possible to parse affected tag for VT %s: %s", vt_id, e
             )
         return tostring(_affected).decode('utf-8')
 
     @staticmethod
-    def get_insight_vt_as_xml_str(vt_id, insight):
-        """ Return insight as string.
+    def get_insight_vt_as_xml_str(vt_id: str, insight: str) -> str:
+        """Return insight as string.
         Arguments:
-            vt_id (str): VT OID. Only used for logging in error case.
-            insight (str): String giving an insight of the vulnerability.
+            vt_id: VT OID. Only used for logging in error case.
+            insight: String giving an insight of the vulnerability.
         Return:
-            string: xml element as string.
+            Xml element as string.
         """
         _insight = Element('insight')
         try:
             _insight.text = insight
         except ValueError as e:
             logger.warning(
-                "Not possible to parse insight tag for vt %s: %s", vt_id, e
+                "Not possible to parse insight tag for VT %s: %s", vt_id, e
             )
         return tostring(_insight).decode('utf-8')
 
     @staticmethod
-    def get_solution_vt_as_xml_str(vt_id, solution, solution_type=None):
-        """ Return solution as string.
+    def get_solution_vt_as_xml_str(
+        vt_id: str,
+        solution: str,
+        solution_type: Optional[str] = None,
+        solution_method: Optional[str] = None,
+    ) -> str:
+        """Return solution as string.
         Arguments:
-            vt_id (str): VT OID. Only used for logging in error case.
-            solution (str): String giving a possible solution.
-            solution_type (str): A solution type
+            vt_id: VT OID. Only used for logging in error case.
+            solution: String giving a possible solution.
+            solution_type: A solution type
+            solution_method: A solution method
         Return:
-            string: xml element as string.
+            Xml element as string.
         """
         _solution = Element('solution')
         try:
             _solution.text = solution
         except ValueError as e:
             logger.warning(
-                "Not possible to parse solution tag for vt %s: %s", vt_id, e
+                "Not possible to parse solution tag for VT %s: %s", vt_id, e
             )
         if solution_type:
             _solution.set('type', solution_type)
+        if solution_method:
+            _solution.set('method', solution_method)
         return tostring(_solution).decode('utf-8')
 
     @staticmethod
     def get_detection_vt_as_xml_str(
-        vt_id, vuldetect=None, qod_type=None, qod=None
-    ):  # pylint: disable=arguments-differ
-        """ Return detection as string.
+        vt_id: str,
+        detection: Optional[str] = None,
+        qod_type: Optional[str] = None,
+        qod: Optional[str] = None,
+    ) -> str:
+        """Return detection as string.
         Arguments:
-            vt_id (str): VT OID. Only used for logging in error case.
-            vuldetect (str, opt): String which explain how the vulnerability
-                was detected.
-            qod_type (str, opt): qod type.
-            qod (str, opt): qod value.
+            vt_id: VT OID. Only used for logging in error case.
+            detection: String which explain how the vulnerability
+              was detected.
+            qod_type: qod type.
+            qod: qod value.
         Return:
-            string: xml element as string.
+            Xml element as string.
         """
         _detection = Element('detection')
-        if vuldetect:
+        if detection:
             try:
-                _detection.text = vuldetect
+                _detection.text = detection
             except ValueError as e:
                 logger.warning(
-                    "Not possible to parse detection tag for vt %s: %s",
+                    "Not possible to parse detection tag for VT %s: %s",
                     vt_id,
                     e,
                 )
@@ -925,7 +910,7 @@ class OSPDopenvas(OSPDaemon):
         return tostring(_detection).decode('utf-8')
 
     @property
-    def is_running_as_root(self):
+    def is_running_as_root(self) -> bool:
         """ Check if it is running as root user."""
         if self._is_running_as_root is not None:
             return self._is_running_as_root
@@ -937,7 +922,7 @@ class OSPDopenvas(OSPDaemon):
         return self._is_running_as_root
 
     @property
-    def sudo_available(self):
+    def sudo_available(self) -> bool:
         """ Checks that sudo is available """
         if self._sudo_available is not None:
             return self._sudo_available
@@ -946,133 +931,154 @@ class OSPDopenvas(OSPDaemon):
             self._sudo_available = False
             return self._sudo_available
 
-        try:
-            subprocess.check_call(
-                ['sudo', '-n', 'openvas', '-s'], stdout=subprocess.PIPE
-            )
-            self._sudo_available = True
-        except (subprocess.SubprocessError, OSError) as e:
-            logger.debug(
-                'It was not possible to call openvas with sudo. '
-                'The scanner will run as non-root user. Reason %s',
-                e,
-            )
-            self._sudo_available = False
+        self._sudo_available = Openvas.check_sudo()
 
         return self._sudo_available
 
-    def check(self):
-        """ Checks that openvas command line tool is found and
-        is executable. """
-        try:
-            result = subprocess.check_output(
-                ['openvas', '-V'], stderr=subprocess.STDOUT
+    def check(self) -> bool:
+        """Checks that openvas command line tool is found and
+        is executable."""
+        has_openvas = Openvas.check()
+        if not has_openvas:
+            logger.error(
+                'openvas executable not available. Please install openvas'
+                ' into your PATH.'
             )
-            result = result.decode('ascii')
-        except OSError:
-            # The command is not available
-            return False
+        return has_openvas
 
-        if result is None:
-            return False
-
-        version = result.split('\n')
-        if version[0].find('OpenVAS') < 0:
-            return False
-
-        self.parse_param()
-        self.scanner_info['version'] = version[0]
-
-        return True
-
-    def update_progress(self, scan_id, target, current_host, msg):
-        """ Calculate percentage and update the scan status of a host
+    def update_progress(self, scan_id: str, current_host: str, msg: str):
+        """Calculate percentage and update the scan status of a host
         for the progress bar.
         Arguments:
-            scan_id (uuid): Scan ID to identify the current scan process.
-            target (str): Target to be updated with the calculated
-                          scan progress.
-            msg (str): String with launched and total plugins.
+            scan_id: Scan ID to identify the current scan process.
+            current_host: Host in the target to be updated.
+            msg: String with launched and total plugins.
         """
         try:
             launched, total = msg.split('/')
         except ValueError:
             return
-        if float(total) == 0:
+
+        try:
+            if float(total) == 0:
+                return
+            elif float(total) == ScanProgress.DEAD_HOST:
+                host_prog = ScanProgress.DEAD_HOST
+            else:
+                host_prog = int((float(launched) / float(total)) * 100)
+        except TypeError:
             return
-        elif float(total) == -1:
-            host_prog = 100
-        else:
-            host_prog = (float(launched) / float(total)) * 100
-        self.set_scan_host_progress(scan_id, target, current_host, host_prog)
 
-    def get_openvas_status(self, scan_id, target, current_host):
-        """ Get all status entries from redis kb.
+        self.set_scan_host_progress(
+            scan_id, host=current_host, progress=host_prog
+        )
+        logger.debug(
+            '%s: Host %s has progress: %d', scan_id, current_host, host_prog
+        )
+
+    def report_openvas_scan_status(
+        self, scan_db: ScanDB, scan_id: str, current_host: str
+    ):
+        """Get all status entries from redis kb.
+
         Arguments:
-            scan_id (uuid): Scan ID to identify the current scan.
-            target (str): Target progress to be updated.
+            scan_id: Scan ID to identify the current scan.
+            current_host: Host to be updated.
         """
-        res = self.openvas_db.get_status()
+        res = scan_db.get_scan_status()
         while res:
-            self.update_progress(scan_id, target, current_host, res)
-            res = self.openvas_db.get_status()
+            self.update_progress(scan_id, current_host, res)
+            res = scan_db.get_scan_status()
 
-    def get_severity_score(self, oid):
-        """ Return the severity score for the given oid.
+    def get_severity_score(self, vt_aux: dict) -> Optional[float]:
+        """Return the severity score for the given oid.
         Arguments:
-            oid (str): VT OID from which to get the severity vector
+            vt_aux: VT element from which to get the severity vector
         Returns:
             The calculated cvss base value. None if there is no severity
             vector or severity type is not cvss base version 2.
         """
-        severity_type = self.vts[oid]['severities'].get('severity_type')
-        severity_vector = self.vts[oid]['severities'].get(
-            'severity_base_vector'
-        )
+        if vt_aux:
+            severity_type = vt_aux['severities'].get('severity_type')
+            severity_vector = vt_aux['severities'].get('severity_base_vector')
 
-        if severity_type == "cvss_base_v2" and severity_vector:
-            return CVSS.cvss_base_v2_value(severity_vector)
+            if severity_type == "cvss_base_v2" and severity_vector:
+                return CVSS.cvss_base_v2_value(severity_vector)
 
         return None
 
-    def get_openvas_result(self, scan_id, current_host):
+    def report_openvas_results(
+        self, db: BaseDB, scan_id: str, current_host: str
+    ) -> int:
         """ Get all result entries from redis kb. """
-        res = self.openvas_db.get_result()
-        while res:
+
+        vthelper = VtHelper(self.nvti)
+
+        # Result messages come in the next form, with optional uri field
+        # type ||| hostname ||| port ||| OID ||| value [|||uri]
+        all_results = db.get_result()
+        res_list = ResultList()
+        total_dead = 0
+        total_results = len(all_results)
+
+        for res in all_results:
+            if not res:
+                continue
+
             msg = res.split('|||')
             roid = msg[3].strip()
             rqod = ''
             rname = ''
             rhostname = msg[1].strip() if msg[1] else ''
-            host_is_dead = "Host dead" in msg[4]
-            valid_oid = roid and roid in self.vts
+            host_is_dead = "Host dead" in msg[4] or msg[0] == "DEADHOST"
+            host_count = msg[0] == "HOSTS_COUNT"
+            host_deny = "Host access denied" in msg[4]
+            vt_aux = None
 
-            if not valid_oid and not host_is_dead:
+            # URI is optional and msg list length must be checked
+            ruri = ''
+            if len(msg) > 5:
+                ruri = msg[5]
+
+            if roid and not host_is_dead and not host_deny and not host_count:
+                vt_aux = vthelper.get_single_vt(roid)
+
+            if (
+                not vt_aux
+                and not host_is_dead
+                and not host_deny
+                and not host_count
+            ):
                 logger.warning('Invalid VT oid %s for a result', roid)
 
-            if valid_oid and not host_is_dead:
-                if self.vts[roid].get('qod_type'):
-                    qod_t = self.vts[roid].get('qod_type')
+            if vt_aux:
+                if vt_aux.get('qod_type'):
+                    qod_t = vt_aux.get('qod_type')
                     rqod = self.nvti.QOD_TYPES[qod_t]
-                elif self.vts[roid].get('qod'):
-                    rqod = self.vts[roid].get('qod')
+                elif vt_aux.get('qod'):
+                    rqod = vt_aux.get('qod')
 
-                rname = self.vts[roid].get('name')
+                rname = vt_aux.get('name')
 
             if msg[0] == 'ERRMSG':
-                self.add_scan_error(
-                    scan_id,
+                # Some errors are generated before a host is scanned
+                # use the hostname passed in the message if
+                # no current host is available.
+                if not current_host and rhostname:
+                    current_host = rhostname
+
+                res_list.add_scan_error_to_list(
                     host=current_host,
                     hostname=rhostname,
                     name=rname,
                     value=msg[4],
                     port=msg[2],
                     test_id=roid,
+                    uri=ruri,
                 )
 
             if msg[0] == 'LOG':
-                self.add_scan_log(
-                    scan_id,
+                res_list.add_scan_log_to_list(
                     host=current_host,
                     hostname=rhostname,
                     name=rname,
@@ -1080,21 +1086,21 @@ class OSPDopenvas(OSPDaemon):
                     port=msg[2],
                     qod=rqod,
                     test_id=roid,
+                    uri=ruri,
                 )
 
             if msg[0] == 'HOST_DETAIL':
-                self.add_scan_host_detail(
-                    scan_id,
+                res_list.add_scan_host_detail_to_list(
                     host=current_host,
                     hostname=rhostname,
                     name=rname,
                     value=msg[4],
+                    uri=ruri,
                 )
 
             if msg[0] == 'ALARM':
-                rseverity = self.get_severity_score(roid)
-                self.add_scan_alarm(
-                    scan_id,
+                rseverity = self.get_severity_score(vt_aux)
+                res_list.add_scan_alarm_to_list(
                     host=current_host,
                     hostname=rhostname,
                     name=rname,
@@ -1103,566 +1109,323 @@ class OSPDopenvas(OSPDaemon):
                     test_id=roid,
                     severity=rseverity,
                     qod=rqod,
+                    uri=ruri,
                 )
 
-            res = self.openvas_db.get_result()
+            # To process non-scanned dead hosts when
+            # test_alive_host_only in openvas is enable
+            if msg[0] == 'DEADHOST':
+                try:
+                    total_dead = int(msg[4])
+                except TypeError:
+                    logger.debug('Error processing dead host count')
 
-    def get_openvas_timestamp_scan_host(self, scan_id, target):
+            # To update total host count
+            if msg[0] == 'HOSTS_COUNT':
+                try:
+                    count_total = int(msg[4])
+                    logger.debug(
+                        '%s: Set total hosts counted by OpenVAS: %d',
+                        scan_id,
+                        count_total,
+                    )
+                    self.set_scan_total_hosts(scan_id, count_total)
+                except TypeError:
+                    logger.debug('Error processing total host count')
+
+        # Insert result batch into the scan collection table.
+        if len(res_list):
+            self.scan_collection.add_result_list(scan_id, res_list)
+            logger.debug(
+                '%s: Inserting %d results into scan collection table',
+                scan_id,
+                len(res_list),
+            )
+        if total_dead:
+            self.scan_collection.set_amount_dead_hosts(
+                scan_id, total_dead=total_dead
+            )
+            logger.debug(
+                '%s: Set %d hosts as dead counted by OpenVAS',
+                scan_id,
+                total_dead,
+            )
+        return total_results
+
+    def report_openvas_timestamp_scan_host(
+        self, scan_db: ScanDB, scan_id: str, host: str
+    ):
         """ Get start and end timestamp of a host scan from redis kb. """
-        timestamp = self.openvas_db.get_host_scan_scan_end_time()
+        timestamp = scan_db.get_host_scan_end_time()
         if timestamp:
             self.add_scan_log(
-                scan_id, host=target, name='HOST_END', value=timestamp
+                scan_id, host=host, name='HOST_END', value=timestamp
             )
+            logger.debug('%s: Host %s set HOST_END', scan_id, host)
             return
-        timestamp = self.openvas_db.get_host_scan_scan_start_time()
+
+        timestamp = scan_db.get_host_scan_start_time()
         if timestamp:
             self.add_scan_log(
-                scan_id, host=target, name='HOST_START', value=timestamp
+                scan_id, host=host, name='HOST_START', value=timestamp
             )
+            logger.debug('%s: Host %s set HOST_START', scan_id, host)
             return
 
-    def host_is_finished(self, scan_id):
-        """ Check if the host has finished. """
-        status = self.openvas_db.get_single_item('internal/%s' % scan_id)
-        return status == 'finished'
+    def is_openvas_process_alive(
+        self, kbdb: BaseDB, ovas_pid: str, openvas_scan_id: str
+    ) -> bool:
+        parent_exists = True
+        parent = None
+        try:
+            parent = psutil.Process(int(ovas_pid))
+        except psutil.NoSuchProcess:
+            logger.debug('Process with pid %s already stopped', ovas_pid)
+            parent_exists = False
+        except TypeError:
+            logger.debug(
+                'Scan with ID %s never started or stopped unexpectedly',
+                openvas_scan_id,
+            )
+            parent_exists = False
 
-    def target_is_finished(self, scan_id):
-        """ Check if a target has finished. The scan id to be used is
-        the scan id passed to the openvas, is not the global scan id."""
-        ctx = self.openvas_db.kb_connect(dbnum=self.main_kbindex)
-        scan_id = self.openvas_db.get_single_item(
-            'internal/%s/globalscanid' % scan_id, ctx=ctx
-        )
-        status = self.openvas_db.get_single_item(
-            'internal/%s' % scan_id, ctx=ctx
-        )
+        is_zombie = False
+        if parent and parent.status() == psutil.STATUS_ZOMBIE:
+            logger.debug(
+                ' %s: OpenVAS process is a zombie process',
+                openvas_scan_id,
+            )
+            is_zombie = True
 
-        return status == 'finished' or status is None
+        if (not parent_exists or is_zombie) and kbdb:
+            if kbdb and kbdb.scan_is_stopped(openvas_scan_id):
+                return True
+            return False
 
-    def scan_is_stopped(self, scan_id):
-        """ Check if the parent process has received the stop_scan order.
-        @in scan_id: ID to identify the scan to be stopped.
-        @return 1 if yes, None in other case.
-        """
-        ctx = self.openvas_db.kb_connect(dbnum=self.main_kbindex)
-        self.openvas_db.set_redisctx(ctx)
-        status = self.openvas_db.get_single_item('internal/%s' % scan_id)
-        return status == 'stop_all'
+        return True
 
-    def stop_scan_cleanup(
-        self, global_scan_id
-    ):  # pylint: disable=arguments-differ
-        """ Set a key in redis to indicate the wrapper is stopped.
+    def stop_scan_cleanup(  # pylint: disable=arguments-differ
+        self, global_scan_id: str
+    ):
+        """Set a key in redis to indicate the wrapper is stopped.
         It is done through redis because it is a new multiprocess
         instance and it is not possible to reach the variables
-        of the grandchild process. Send SIGUSR2 to openvas to stop
-        each running scan."""
-        ctx = self.openvas_db.kb_connect()
-        for current_kbi in range(0, self.openvas_db.max_dbindex):
-            self.openvas_db.select_kb(ctx, str(current_kbi), set_global=True)
-            scan_id = self.openvas_db.get_single_item(
-                'internal/%s/globalscanid' % global_scan_id
-            )
-            if scan_id:
-                self.openvas_db.set_single_item(
-                    'internal/%s' % scan_id, ['stop_all']
-                )
-                ovas_pid = self.openvas_db.get_single_item('internal/ovas_pid')
-                parent = None
-                try:
-                    parent = psutil.Process(int(ovas_pid))
-                except psutil.NoSuchProcess:
-                    logger.debug(
-                        'Process with pid %s already stopped', ovas_pid
-                    )
-                except TypeError:
-                    logger.debug(
-                        'Scan with ID %s never started and stopped '
-                        'unexpectedly',
-                        scan_id,
-                    )
+        of the grandchild process.
+        Indirectly sends SIGUSR1 to the running openvas scan process
+        via an invocation of openvas with the --scan-stop option to
+        stop it."""
 
-                if parent:
-                    cmd = ['openvas', '--scan-stop', scan_id]
-                    if not self.is_running_as_root and self.sudo_available:
-                        cmd = ['sudo', '-n'] + cmd
+        openvas_scan_id, kbdb = self.main_db.find_kb_database_by_scan_id(
+            global_scan_id
+        )
+        if kbdb:
+            kbdb.stop_scan(openvas_scan_id)
+            ovas_pid = kbdb.get_scan_process_id()
 
-                    try:
-                        subprocess.Popen(cmd, shell=False)
-                    except OSError as e:
-                        # the command is not available
-                        logger.debug(
-                            'Not possible to Stopping process: %s.' 'Reason %s',
-                            parent,
-                            e,
-                        )
-                        return False
-
-                    logger.debug('Stopping process: %s', parent)
-                    while parent:
-                        try:
-                            parent = psutil.Process(int(ovas_pid))
-                        except psutil.NoSuchProcess:
-                            parent = None
-
-                self.openvas_db.release_db(current_kbi)
-                for host_kb in range(0, self.openvas_db.max_dbindex):
-                    self.openvas_db.select_kb(
-                        ctx, str(host_kb), set_global=True
-                    )
-                    if self.openvas_db.get_single_item('internal/%s' % scan_id):
-                        self.openvas_db.release_db(host_kb)
-
-    def get_vts_in_groups(self, filters):
-        """ Return a list of vts which match with the given filter.
-
-        @input filters A list of filters. Each filter has key, operator and
-                       a value. They are separated by a space.
-                       Supported keys: family
-        @return Return a list of vts which match with the given filter.
-        """
-        vts_list = list()
-        families = dict()
-        for oid in self.vts:
-            family = self.vts[oid]['custom'].get('family')
-            if family not in families:
-                families[family] = list()
-            families[family].append(oid)
-
-        for elem in filters:
-            key, value = elem.split('=')
-            if key == 'family' and value in families:
-                vts_list.extend(families[value])
-        return vts_list
-
-    def get_vt_param_type(self, vtid, vt_param_id):
-        """ Return the type of the vt parameter from the vts dictionary. """
-
-        vt_params_list = self.vts[vtid].get("vt_params")
-        if vt_params_list.get(vt_param_id):
-            return vt_params_list[vt_param_id]["type"]
-        return None
-
-    def get_vt_param_name(self, vtid, vt_param_id):
-        """ Return the type of the vt parameter from the vts dictionary. """
-
-        vt_params_list = self.vts[vtid].get("vt_params")
-        if vt_params_list.get(vt_param_id):
-            return vt_params_list[vt_param_id]["name"]
-        return None
-
-    @staticmethod
-    def check_param_type(vt_param_value, param_type):
-        """ Check if the value of a vt parameter matches with
-        the type founded.
-        """
-        if param_type in [
-            'entry',
-            'password',
-            'radio',
-            'sshlogin',
-        ] and isinstance(vt_param_value, str):
-            return None
-        elif param_type == 'checkbox' and (
-            vt_param_value == '0' or vt_param_value == '1'
-        ):
-            return None
-        elif param_type == 'file':
+            parent = None
             try:
-                b64decode(vt_param_value.encode())
-            except (binascii.Error, AttributeError, TypeError):
-                return 1
-            return None
-        elif param_type == 'integer':
-            try:
-                int(vt_param_value)
-            except ValueError:
-                return 1
-            return None
-
-        return 1
-
-    def process_vts(self, vts):
-        """ Add single VTs and their parameters. """
-        vts_list = []
-        vts_params = []
-        vtgroups = vts.pop('vt_groups')
-
-        if vtgroups:
-            vts_list = self.get_vts_in_groups(vtgroups)
-
-        for vtid, vt_params in vts.items():
-            if vtid not in self.vts.keys():
-                logger.warning(
-                    'The vt %s was not found and it will not be loaded.', vtid
+                parent = psutil.Process(int(ovas_pid))
+            except psutil.NoSuchProcess:
+                logger.debug('Process with pid %s already stopped', ovas_pid)
+            except TypeError:
+                logger.debug(
+                    'Scan with ID %s never started and stopped unexpectedly',
+                    openvas_scan_id,
                 )
-                continue
-            vts_list.append(vtid)
-            for vt_param_id, vt_param_value in vt_params.items():
-                param_type = self.get_vt_param_type(vtid, vt_param_id)
-                param_name = self.get_vt_param_name(vtid, vt_param_id)
-                if not param_type or not param_name:
+
+            if parent:
+                can_stop_scan = Openvas.stop_scan(
+                    openvas_scan_id,
+                    not self.is_running_as_root and self.sudo_available,
+                )
+                if not can_stop_scan:
                     logger.debug(
-                        'Missing type or name for vt parameter %s of %s. '
-                        'It could not be loaded.',
-                        vt_param_id,
-                        vtid,
+                        'Not possible to stop scan process: %s.',
+                        parent,
                     )
-                    continue
-                if vt_param_id == '0':
-                    type_aux = 'integer'
-                else:
-                    type_aux = param_type
-                if self.check_param_type(vt_param_value, type_aux):
-                    logger.debug(
-                        'The vt parameter %s for %s could not be loaded. '
-                        'Expected %s type for parameter value %s',
-                        vt_param_id,
-                        vtid,
-                        type_aux,
-                        str(vt_param_value),
-                    )
-                    continue
-                if type_aux == 'checkbox':
-                    vt_param_value = _from_bool_to_str(int(vt_param_value))
-                param = [
-                    "{0}:{1}:{2}:{3}".format(
-                        vtid, vt_param_id, param_type, param_name
-                    ),
-                    str(vt_param_value),
-                ]
-                vts_params.append(param)
-        return vts_list, vts_params
+                    return False
 
-    @staticmethod
-    def build_credentials_as_prefs(credentials):
-        """ Parse the credential dictionary.
-        @param credentials: Dictionary with the credentials.
+                logger.debug('Stopping process: %s', parent)
 
-        @return A list with the credentials in string format to be
-                added to the redis KB.
-        """
-        cred_prefs_list = []
-        for credential in credentials.items():
-            service = credential[0]
-            cred_params = credentials.get(service)
-            cred_type = cred_params.get('type', '')
-            username = cred_params.get('username', '')
-            password = cred_params.get('password', '')
+                while parent:
+                    if parent.is_running():
+                        time.sleep(0.1)
+                    else:
+                        parent = None
 
-            if service == 'ssh':
-                port = cred_params.get('port', '')
-                cred_prefs_list.append('auth_port_ssh|||' + '{0}'.format(port))
-                cred_prefs_list.append(
-                    OID_SSH_AUTH
-                    + ':1:'
-                    + 'entry:SSH login '
-                    + 'name:|||{0}'.format(username)
-                )
-                if cred_type == 'up':
-                    cred_prefs_list.append(
-                        OID_SSH_AUTH
-                        + ':3:'
-                        + 'password:SSH password '
-                        + '(unsafe!):|||{0}'.format(password)
-                    )
-                else:
-                    private = cred_params.get('private', '')
-                    cred_prefs_list.append(
-                        OID_SSH_AUTH
-                        + ':2:'
-                        + 'password:SSH key passphrase:|||'
-                        + '{0}'.format(password)
-                    )
-                    cred_prefs_list.append(
-                        OID_SSH_AUTH
-                        + ':4:'
-                        + 'file:SSH private key:|||'
-                        + '{0}'.format(private)
-                    )
-            if service == 'smb':
-                cred_prefs_list.append(
-                    OID_SMB_AUTH
-                    + ':1:entry'
-                    + ':SMB login:|||{0}'.format(username)
-                )
-                cred_prefs_list.append(
-                    OID_SMB_AUTH
-                    + ':2:'
-                    + 'password:SMB password:|||'
-                    + '{0}'.format(password)
-                )
-            if service == 'esxi':
-                cred_prefs_list.append(
-                    OID_ESXI_AUTH
-                    + ':1:entry:'
-                    + 'ESXi login name:|||'
-                    + '{0}'.format(username)
-                )
-                cred_prefs_list.append(
-                    OID_ESXI_AUTH
-                    + ':2:'
-                    + 'password:ESXi login password:|||'
-                    + '{0}'.format(password)
-                )
+            for scan_db in kbdb.get_scan_databases():
+                self.main_db.release_database(scan_db)
 
-            if service == 'snmp':
-                community = cred_params.get('community', '')
-                auth_algorithm = cred_params.get('auth_algorithm', '')
-                privacy_password = cred_params.get('privacy_password', '')
-                privacy_algorithm = cred_params.get('privacy_algorithm', '')
-
-                cred_prefs_list.append(
-                    OID_SNMP_AUTH
-                    + ':1:'
-                    + 'password:SNMP Community:|||'
-                    + '{0}'.format(community)
-                )
-                cred_prefs_list.append(
-                    OID_SNMP_AUTH
-                    + ':2:'
-                    + 'entry:SNMPv3 Username:|||'
-                    + '{0}'.format(username)
-                )
-                cred_prefs_list.append(
-                    OID_SNMP_AUTH + ':3:'
-                    'password:SNMPv3 Password:|||' + '{0}'.format(password)
-                )
-                cred_prefs_list.append(
-                    OID_SNMP_AUTH
-                    + ':4:'
-                    + 'radio:SNMPv3 Authentication Algorithm:|||'
-                    + '{0}'.format(auth_algorithm)
-                )
-                cred_prefs_list.append(
-                    OID_SNMP_AUTH
-                    + ':5:'
-                    + 'password:SNMPv3 Privacy Password:|||'
-                    + '{0}'.format(privacy_password)
-                )
-                cred_prefs_list.append(
-                    OID_SNMP_AUTH
-                    + ':6:'
-                    + 'radio:SNMPv3 Privacy Algorithm:|||'
-                    + '{0}'.format(privacy_algorithm)
-                )
-
-        return cred_prefs_list
-
-    def exec_scan(self, scan_id, target):
+    def exec_scan(self, scan_id: str):
         """ Starts the OpenVAS scanner for scan_id scan. """
-        if self.pending_feed:
-            logger.info(
-                '%s: There is a pending feed update. '
-                'The scan can not be started.',
-                scan_id,
-            )
-            self.add_scan_error(
-                scan_id,
-                name='',
-                host=target,
-                value=(
-                    'It was not possible to start the scan,'
-                    'because a pending feed update. Please try later'
-                ),
-            )
-            return 2
-
-        ports = self.get_scan_ports(scan_id, target)
-        if not ports:
-            self.add_scan_error(
-                scan_id, name='', host=target, value='No port list defined.'
-            )
-            return 2
-
-        # Get scan options
-        options = self.get_scan_options(scan_id)
-        prefs_val = []
-        ctx = self.openvas_db.kb_new()
-        self.openvas_db.set_redisctx(ctx)
-        self.main_kbindex = self.openvas_db.db_index
-
-        # To avoid interference between scan process during a parallel scanning
-        # new uuid is used internally for each scan.
-        openvas_scan_id = str(uuid.uuid4())
-        self.openvas_db.add_single_item(
-            'internal/%s' % openvas_scan_id, ['new']
-        )
-        self.openvas_db.add_single_item(
-            'internal/%s/globalscanid' % scan_id, [openvas_scan_id]
-        )
-        self.openvas_db.add_single_item('internal/scanid', [openvas_scan_id])
-
-        exclude_hosts = self.get_scan_exclude_hosts(scan_id, target)
-        if exclude_hosts:
-            options['exclude_hosts'] = exclude_hosts
-
-        # Get unfinished hosts, in case it is a resumed scan. And added
-        # into exclude_hosts scan preference. Set progress for the finished ones
-        # to 100%.
-        finished_hosts = self.get_scan_finished_hosts(scan_id)
-        if finished_hosts:
-            if exclude_hosts:
-                finished_hosts_str = ','.join(finished_hosts)
-                exclude_hosts = exclude_hosts + ',' + finished_hosts_str
-                options['exclude_hosts'] = exclude_hosts
-            else:
-                options['exclude_hosts'] = ','.join(finished_hosts)
-
-        # Set scan preferences
-        for key, value in options.items():
-            item_type = ''
-            if key in OSPD_PARAMS:
-                item_type = OSPD_PARAMS[key].get('type')
-            if item_type == 'boolean':
-                val = _from_bool_to_str(value)
-            else:
-                val = str(value)
-            prefs_val.append(key + "|||" + val)
-        self.openvas_db.add_single_item(
-            'internal/%s/scanprefs' % openvas_scan_id, prefs_val
-        )
-
-        # Store main_kbindex as global preference
-        ov_maindbid = 'ov_maindbid|||%d' % self.main_kbindex
-        self.openvas_db.add_single_item(
-            'internal/%s/scanprefs' % openvas_scan_id, [ov_maindbid]
-        )
-
-        # Set target
-        target_aux = 'TARGET|||%s' % target
-        self.openvas_db.add_single_item(
-            'internal/%s/scanprefs' % openvas_scan_id, [target_aux]
-        )
-        # Set port range
-        port_range = 'port_range|||%s' % ports
-        self.openvas_db.add_single_item(
-            'internal/%s/scanprefs' % openvas_scan_id, [port_range]
-        )
-
-        # If credentials or vts fail, set this variable.
         do_not_launch = False
+        kbdb = self.main_db.get_new_kb_database()
+        scan_prefs = PreferenceHandler(
+            scan_id, kbdb, self.scan_collection, self.nvti
+        )
+        openvas_scan_id = scan_prefs.prepare_openvas_scan_id_for_openvas()
+        scan_prefs.prepare_target_for_openvas()
 
-        # Set credentials
-        credentials = self.get_scan_credentials(scan_id, target)
-        if credentials:
-            cred_prefs = self.build_credentials_as_prefs(credentials)
-            if cred_prefs:
-                self.openvas_db.add_single_item(
-                    'internal/%s/scanprefs' % openvas_scan_id, cred_prefs
-                )
-            else:
-                self.add_scan_error(
-                    scan_id, name='', host=target, value='Malformed credential.'
-                )
-                do_not_launch = True
-
-        # Set plugins to run
-        nvts = self.get_scan_vts(scan_id)
-        if nvts != '':
-            nvts_list, nvts_params = self.process_vts(nvts)
-            # Add nvts list
-            separ = ';'
-            plugin_list = 'plugin_set|||%s' % separ.join(nvts_list)
-            self.openvas_db.add_single_item(
-                'internal/%s/scanprefs' % openvas_scan_id, [plugin_list]
-            )
-            # Add nvts parameters
-            for elem in nvts_params:
-                item = '%s|||%s' % (elem[0], elem[1])
-                self.openvas_db.add_single_item(
-                    'internal/%s/scanprefs' % openvas_scan_id, [item]
-                )
-        else:
+        if not scan_prefs.prepare_ports_for_openvas():
             self.add_scan_error(
-                scan_id, name='', host=target, value='No VTS to run.'
+                scan_id, name='', host='', value='No port list defined.'
             )
             do_not_launch = True
 
-        if do_not_launch:
-            self.openvas_db.release_db(self.main_kbindex)
-            return 2
+        # Set credentials
+        if not scan_prefs.prepare_credentials_for_openvas():
+            self.add_scan_error(
+                scan_id, name='', host='', value='Malformed credential.'
+            )
+            do_not_launch = True
 
-        cmd = ['openvas', '--scan-start', openvas_scan_id]
-        if not self.is_running_as_root and self.sudo_available:
-            cmd = ['sudo', '-n'] + cmd
+        if not scan_prefs.prepare_plugins_for_openvas():
+            self.add_scan_error(
+                scan_id, name='', host='', value='No VTS to run.'
+            )
+            do_not_launch = True
 
-        if self._niceness is not None:
-            cmd = ['nice', '-n', self._niceness] + cmd
+        scan_prefs.prepare_main_kbindex_for_openvas()
+        scan_prefs.prepare_host_options_for_openvas()
+        scan_prefs.prepare_scan_params_for_openvas(OSPD_PARAMS)
+        scan_prefs.prepare_reverse_lookup_opt_for_openvas()
+        scan_prefs.prepare_alive_test_option_for_openvas()
 
-        logger.debug("Running scan with niceness %s", self._niceness)
-        try:
-            result = subprocess.Popen(cmd, shell=False)
-        except OSError:
-            # the command is not available
-            return False
+        # VT preferences are stored after all preferences have been processed,
+        # since alive tests preferences have to be able to overwrite default
+        # preferences of ping_host.nasl for the classic method.
+        scan_prefs.prepare_nvt_preferences()
+        scan_prefs.prepare_boreas_alive_test()
+
+        # Release memory used for scan preferences.
+        del scan_prefs
+
+        if do_not_launch or kbdb.scan_is_stopped(openvas_scan_id):
+            self.main_db.release_database(kbdb)
+            return
+
+        result = Openvas.start_scan(
+            openvas_scan_id,
+            not self.is_running_as_root and self.sudo_available,
+            self._niceness,
+        )
+
+        if result is None:
+            self.main_db.release_database(kbdb)
+            return
 
         ovas_pid = result.pid
+        kbdb.add_scan_process_id(ovas_pid)
         logger.debug('pid = %s', ovas_pid)
-        self.openvas_db.add_single_item('internal/ovas_pid', [ovas_pid])
 
         # Wait until the scanner starts and loads all the preferences.
-        while (
-            self.openvas_db.get_single_item('internal/' + openvas_scan_id)
-            == 'new'
-        ):
+        while kbdb.get_status(openvas_scan_id) == 'new':
             res = result.poll()
             if res and res < 0:
                 self.stop_scan_cleanup(scan_id)
-                msg = (
+                logger.error(
                     'It was not possible run the task %s, since openvas ended '
-                    'unexpectedly with errors during launching.' % scan_id
+                    'unexpectedly with errors during launching.',
+                    scan_id,
                 )
-                logger.error(msg)
-                return 1
+                return
+
             time.sleep(1)
 
         no_id_found = False
+        got_results = False
         while True:
-            time.sleep(3)
-            # Check if the client stopped the whole scan
-            if self.scan_is_stopped(openvas_scan_id):
-                return 1
+            if not kbdb.target_is_finished(
+                scan_id
+            ) and not self.is_openvas_process_alive(
+                kbdb, ovas_pid, openvas_scan_id
+            ):
+                logger.error(
+                    'Task %s was unexpectedly stopped or killed.',
+                    scan_id,
+                )
+                self.add_scan_error(
+                    scan_id,
+                    name='',
+                    host='',
+                    value='Task was unexpectedly stopped or killed.',
+                )
+                kbdb.stop_scan(openvas_scan_id)
+                for scan_db in kbdb.get_scan_databases():
+                    self.main_db.release_database(scan_db)
+                self.main_db.release_database(kbdb)
+                return
 
-            ctx = self.openvas_db.kb_connect(self.main_kbindex)
-            self.openvas_db.set_redisctx(ctx)
-            self.get_openvas_result(scan_id, "")
-            dbs = self.openvas_db.get_list_item('internal/dbindex')
-            for i in list(dbs):
-                if i == self.main_kbindex:
-                    continue
-                self.openvas_db.select_kb(ctx, str(i), set_global=True)
-                id_aux = self.openvas_db.get_single_item('internal/scan_id')
+            # Wait a second before trying to get result from redis if there
+            # was no results before.
+            # Otherwise, wait 50 msec to give access other process to redis.
+            if not got_results:
+                time.sleep(1)
+            else:
+                time.sleep(0.05)
+            got_results = False
+
+            # Check if the client stopped the whole scan
+            if kbdb.scan_is_stopped(openvas_scan_id):
+                logger.debug('%s: Scan stopped by the client', scan_id)
+                # clean main_db, but wait for scanner to finish.
+                while not kbdb.target_is_finished(scan_id):
+                    logger.debug('%s: Waiting the scan to finish', scan_id)
+                    time.sleep(1)
+                self.main_db.release_database(kbdb)
+                return
+
+            self.report_openvas_results(kbdb, scan_id, "")
+
+            res_count = 0
+            for scan_db in kbdb.get_scan_databases():
+                id_aux = scan_db.get_scan_id()
                 if not id_aux:
                     continue
+
                 if id_aux == openvas_scan_id:
                     no_id_found = False
-                    current_host = self.openvas_db.get_host_ip()
-                    self.get_openvas_result(scan_id, current_host)
-                    self.get_openvas_status(scan_id, target, current_host)
-                    self.get_openvas_timestamp_scan_host(scan_id, current_host)
-                    if self.host_is_finished(openvas_scan_id):
-                        self.set_scan_host_finished(
-                            scan_id, target, current_host
+                    current_host = scan_db.get_host_ip()
+
+                    res_count += self.report_openvas_results(
+                        scan_db, scan_id, current_host
+                    )
+                    if res_count > 0:
+                        got_results = True
+
+                    self.report_openvas_scan_status(
+                        scan_db, scan_id, current_host
+                    )
+                    self.report_openvas_timestamp_scan_host(
+                        scan_db, scan_id, current_host
+                    )
+
+                    if scan_db.host_is_finished(openvas_scan_id):
+                        self.report_openvas_scan_status(
+                            scan_db, scan_id, current_host
                         )
-                        self.get_openvas_status(scan_id, target, current_host)
-                        self.get_openvas_timestamp_scan_host(
-                            scan_id, current_host
+
+                        self.report_openvas_timestamp_scan_host(
+                            scan_db, scan_id, current_host
                         )
-                        self.openvas_db.select_kb(
-                            ctx, str(self.main_kbindex), set_global=False
-                        )
-                        self.openvas_db.remove_list_item('internal/dbindex', i)
-                        self.openvas_db.release_db(i)
+                        if current_host:
+                            self.sort_host_finished(
+                                scan_id, finished_hosts=current_host
+                            )
+
+                        kbdb.remove_scan_database(scan_db)
+                        self.main_db.release_database(scan_db)
 
             # Scan end. No kb in use for this scan id
-            if no_id_found and self.target_is_finished(scan_id):
+            if no_id_found and kbdb.target_is_finished(scan_id):
+                logger.debug('%s: Target is finished', scan_id)
                 break
+
             no_id_found = True
 
         # Delete keys from KB related to this scan task.
-        self.openvas_db.release_db(self.main_kbindex)
+        logger.debug('%s: End Target. Release main database', scan_id)
+        self.main_db.release_database(kbdb)
 
 
 def main():
