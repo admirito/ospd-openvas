@@ -17,10 +17,10 @@ override_dh_auto_install:
 	dh_auto_install
 
 	mkdir -p debian/ospd-openvas/etc/default
-	sed -e 's|<install-prefix>|/usr|g' -e 's|python3.5|python3.8|g' config/ospd-openvas.default > debian/ospd-openvas/etc/default/ospd-openvas.default
+	sed -e '/^PATH=/s|/local||g' -e 's|<install-prefix>||g'  -e 's|ospd-openvas.sock|ospd.sock|g' -e 's|$$OSPD_OPENVAS_PID|/var/run/ospd/ospd-openvas.pid|g' -e 's|\(--lock-file-dir /var/run\)|\1/ospd|' config/ospd-openvas.default > debian/ospd-openvas/etc/default/ospd-openvas.default
 
 	mkdir -p debian/ospd-openvas/lib/systemd/system
-	sed -e 's|<install-prefix>|/usr|g' -e 's|<username>|root|g' -e 's|<groupname>|root|g' -e '/^ExecStart=/a RuntimeDirectory=ospd' config/ospd-openvas.service > debian/ospd-openvas/lib/systemd/system/ospd-openvas.service
+	sed -e 's|<install-prefix>/bin/|/usr/bin/|g' -e 's|<install-prefix>||g' -e 's|$$OSPD_OPENVAS_USER|gvm|g' -e 's|$$OSPD_OPENVAS_GROUP|gvm|g' -e 's|$$OSPD_OPENVAS_PID|/var/run/ospd/ospd-openvas.pid|g' -e '/^ExecStart=/a RuntimeDirectory=ospd' config/ospd-openvas.service > debian/ospd-openvas/lib/systemd/system/ospd-openvas.service
 
 	mkdir -p debian/ospd-openvas/etc/ospd
 	sed -e 's|<install-prefix>||g'  config/ospd.conf > debian/ospd-openvas/etc/ospd/ospd-openvas.conf
